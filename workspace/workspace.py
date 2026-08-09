@@ -653,3 +653,77 @@ class DiscordWorkspace(Workspace):
         await self._api_request("PATCH", f"/guilds/{guild_id}/members/@me", json_data={"nick": nickname})
         new_name = nickname if nickname else "default"
         return f"Server nickname in guild '{guild_id}' changed to '{new_name}' successfully."
+
+    @tool(
+        "discord.dm.list",
+        description="List all active Direct Message (DM) and Group DM conversations with recipient profiles and last message IDs",
+    )
+    async def dm_list(self, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        channels = await self._api_request("GET", "/users/@me/channels")
+        out = []
+        for c in channels:
+            ctype = "group_dm" if c.get("type") == 3 else "dm"
+            recipients = [
+                {
+                    "id": r.get("id"),
+                    "username": r.get("username"),
+                    "global_name": r.get("global_name"),
+                    "avatar": r.get("avatar"),
+                }
+                for r in c.get("recipients", [])
+            ]
+            out.append({
+                "channel_id": c.get("id"),
+                "type": ctype,
+                "name": c.get("name") or (", ".join(r["username"] for r in recipients) if recipients else "DM"),
+                "last_message_id": c.get("last_message_id"),
+                "recipients": recipients,
+            })
+        return out
+
+    @tool(
+        "discord.dm.open",
+        description="Open or get a Direct Message (DM) channel with a target user by User ID",
+        arguments={
+            "user_id": {"type": "string", "description": "Target Discord User ID"}
+        },
+    )
+    async def dm_open(self, user_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        dm = await self._api_request("POST", "/users/@me/channels", json_data={"recipient_id": user_id})
+        recipients = [
+            {"id": r.get("id"), "username": r.get("username"), "global_name": r.get("global_name")}
+            for r in dm.get("recipients", [])
+        ]
+        return {
+            "channel_id": dm.get("id"),
+            "recipient": recipients[0] if recipients else None,
+            "info": f"DM channel opened with user '{user_id}'. Use channel_id to read/send messages.",
+        }
+
+    @tool(
+        "discord.dm.send",
+        description="Send a Direct Message (DM) directly to a target User ID or DM Channel ID",
+        arguments={
+            "recipient_id": {"type": "string", "description": "Target Discord User ID or DM Channel ID"},
+            "content": {"type": "string", "description": "Message text content", "default": ""},
+            "reply_to": {"type": "string", "description": "Optional message ID to reply to", "default": ""},
+            "file_path": {"type": "string", "description": "Optional local file path to attach and upload", "default": ""}
+        },
+    )
+    async def dm_send(
+        self,
+        recipient_id: str,
+        content: str = "",
+        reply_to: str = "",
+        file_path: str = "",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        target_channel_id = recipient_id
+        try:
+            dm = await self._api_request("POST", "/users/@me/channels", json_data={"recipient_id": recipient_id})
+            if dm and "id" in dm:
+                target_channel_id = dm["id"]
+        except Exception:
+            target_channel_id = recipient_id
+
+        return await self.messages_send(channel_id=target_channel_id, content=content, reply_to=reply_to, file_path=file_path)
