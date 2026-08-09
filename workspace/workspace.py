@@ -7,6 +7,7 @@ messages with attachments, sending messages, replies, member lookup, and notific
 Follows ADR-0004 for one-shot login tool state management.
 """
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,23 @@ import aiohttp
 from unai.sdk import Workspace, tool
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
+
+
+def _file_to_base64_data_uri(file_path: str) -> str:
+    p = Path(file_path)
+    if not p.exists():
+        raise RuntimeError(f"Avatar/Banner file not found: {file_path}")
+    data = p.read_bytes()
+    b64 = base64.b64encode(data).decode("utf-8")
+    ext = p.suffix.lower()
+    mime = "image/png"
+    if ext in [".jpg", ".jpeg"]:
+        mime = "image/jpeg"
+    elif ext == ".gif":
+        mime = "image/gif"
+    elif ext == ".webp":
+        mime = "image/webp"
+    return f"data:{mime};base64,{b64}"
 
 
 def _get_data_dir() -> Path:
@@ -574,3 +592,64 @@ class DiscordWorkspace(Workspace):
                     "timestamp": m.get("timestamp"),
                 })
         return out
+
+    @tool(
+        "discord.profile.update",
+        description="Update account profile details including Display Name (global_name), Bio/About Me, Avatar image, Banner image, or accent color",
+        arguments={
+            "global_name": {"type": "string", "description": "New Display Name", "default": ""},
+            "bio": {"type": "string", "description": "New About Me / Bio text", "default": ""},
+            "avatar_path": {"type": "string", "description": "Local image file path to upload as avatar", "default": ""},
+            "banner_path": {"type": "string", "description": "Local image file path to upload as banner", "default": ""},
+            "accent_color": {"type": "integer", "description": "Integer color code (e.g. 16711680 for red)", "default": 0}
+        },
+    )
+    async def profile_update(
+        self,
+        global_name: str = "",
+        bio: str = "",
+        avatar_path: str = "",
+        banner_path: str = "",
+        accent_color: int = 0,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if global_name:
+            payload["global_name"] = global_name
+        if bio:
+            payload["bio"] = bio
+        if avatar_path:
+            payload["avatar"] = _file_to_base64_data_uri(avatar_path)
+        if banner_path:
+            payload["banner"] = _file_to_base64_data_uri(banner_path)
+        if accent_color > 0:
+            payload["accent_color"] = accent_color
+
+        if not payload:
+            raise RuntimeError("At least one profile parameter must be specified to update profile.")
+
+        res = await self._api_request("PATCH", "/users/@me", json_data=payload)
+        return {
+            "id": res.get("id"),
+            "username": res.get("username"),
+            "global_name": res.get("global_name"),
+            "bio": res.get("bio"),
+            "avatar": res.get("avatar"),
+            "banner": res.get("banner"),
+            "info": "Profile updated successfully.",
+        }
+
+    @tool(
+        "discord.members.set_nickname",
+        description="Change your nickname in a specific Discord server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Guild (server) ID"},
+            "nickname": {"type": "string", "description": "New nickname for the server (empty string to reset)"}
+        },
+    )
+    async def members_set_nickname(
+        self, guild_id: str, nickname: str = "", reason: Optional[str] = None
+    ) -> str:
+        await self._api_request("PATCH", f"/guilds/{guild_id}/members/@me", json_data={"nick": nickname})
+        new_name = nickname if nickname else "default"
+        return f"Server nickname in guild '{guild_id}' changed to '{new_name}' successfully."
