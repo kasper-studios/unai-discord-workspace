@@ -1292,3 +1292,72 @@ class DiscordWorkspace(Workspace):
             "gateway_connected": self._gateway_connected,
             "info": info_str,
         }
+
+    @tool(
+        "discord.emojis.list",
+        description="List custom emojis available on a specific Discord server (guild) with formatted strings for use in messages and reactions",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"}
+        },
+    )
+    async def emojis_list(self, guild_id: str, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        emojis = await self._api_request("GET", f"/guilds/{guild_id}/emojis")
+        out = []
+        for e in emojis:
+            eid = e.get("id")
+            ename = e.get("name")
+            animated = e.get("animated", False)
+            tag = f"a" if animated else ""
+            formatted = f"<{tag}:{ename}:{eid}>"
+            reaction_fmt = f"{ename}:{eid}"
+            out.append({
+                "id": eid,
+                "name": ename,
+                "animated": animated,
+                "available": e.get("available", True),
+                "formatted": formatted,
+                "reaction_format": reaction_fmt,
+                "user": e.get("user", {}).get("username") if e.get("user") else None,
+            })
+        return out
+
+    @tool(
+        "discord.emojis.create",
+        description="Create a new custom emoji on a server (guild) by uploading a local image file (requires MANAGE_EMOJIS_AND_STICKERS permission)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "name": {"type": "string", "description": "Name for the custom emoji (alphanumeric and underscores)"},
+            "image_path": {"type": "string", "description": "Local image file path (.png, .jpg, .gif)"}
+        },
+    )
+    async def emojis_create(
+        self, guild_id: str, name: str, image_path: str, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        b64_image = _file_to_base64_data_uri(image_path)
+        payload = {"name": name, "image": b64_image}
+        e = await self._api_request("POST", f"/guilds/{guild_id}/emojis", json_data=payload)
+        eid = e.get("id")
+        ename = e.get("name")
+        animated = e.get("animated", False)
+        tag = f"a" if animated else ""
+        return {
+            "id": eid,
+            "name": ename,
+            "animated": animated,
+            "formatted": f"<{tag}:{ename}:{eid}>",
+            "info": f"Custom emoji '{ename}' created successfully.",
+        }
+
+    @tool(
+        "discord.emojis.delete",
+        description="Delete a custom emoji from a server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "emoji_id": {"type": "string", "description": "Emoji ID to delete"}
+        },
+    )
+    async def emojis_delete(
+        self, guild_id: str, emoji_id: str, reason: Optional[str] = None
+    ) -> str:
+        await self._api_request("DELETE", f"/guilds/{guild_id}/emojis/{emoji_id}")
+        return f"Custom emoji '{emoji_id}' deleted successfully from guild '{guild_id}'."
