@@ -53,7 +53,38 @@ class DiscordWorkspace(Workspace):
         super().__init__(runtime_id=runtime_id, bus=bus, **kwargs)
         self._token: Optional[str] = None
         self._user_info: Optional[Dict[str, Any]] = None
+        self._gateway_ws: Optional[Any] = None
+        self._gateway_task: Optional[Any] = None
+        self._gateway_connected: bool = False
+        self._gateway_last_seq: Optional[int] = None
+        self._notifications_cache: List[Dict[str, Any]] = []
         self._load_saved_token()
+        self._load_notifications_cache()
+
+    def _load_notifications_cache(self) -> None:
+        nf = _get_data_dir() / "notifications_cache.json"
+        if nf.exists():
+            try:
+                self._notifications_cache = json.loads(nf.read_text())
+            except Exception:
+                self._notifications_cache = []
+
+    def _save_notifications_cache(self) -> None:
+        nf = _get_data_dir() / "notifications_cache.json"
+        try:
+            # Keep max 200 notifications in persistent cache
+            nf.write_text(json.dumps(self._notifications_cache[:200], ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
+    def _add_notification(self, notif: Dict[str, Any]) -> None:
+        self._notifications_cache.insert(0, notif)
+        self._save_notifications_cache()
+        if self.bus:
+            try:
+                self.bus.emit("discord.notification", notif)
+            except Exception:
+                pass
 
     def _load_saved_token(self) -> None:
         tf = _get_token_file()
@@ -61,6 +92,7 @@ class DiscordWorkspace(Workspace):
             try:
                 data = json.loads(tf.read_text())
                 self._token = data.get("token")
+                self._user_info = data.get("user")
             except Exception:
                 self._token = None
 
@@ -106,6 +138,149 @@ class DiscordWorkspace(Workspace):
                     return json.loads(resp_text)
                 except Exception:
                     return resp_text
+
+    async def _gateway_listener(self) -> None:
+        """Background Gateway listener loop receiving live events from Discord Gateway v10."""
+        import datetime
+        ws_url = "wss://gateway.discord.gg/?v=10&encoding=json"
+        token = self._token.strip() if self._token else ""
+        if not token:
+            self._gateway_connected = False
+            return
+
+        while True:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.ws_connect(ws_url) as ws:
+                        self._gateway_ws = ws
+                        self._gateway_connected = True
+                        heartbeat_task = None
+
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                data = json.loads(msg.data)
+                                op = data.get("op")
+                                t = data.get("t")
+                                d = data.get("d", {})
+                                s = data.get("s")
+                                if s is not None:
+                                    self._gateway_last_seq = s
+
+                                # OP 10 Hello -> Send Identify and start heartbeat
+                                if op == 10:
+                                    interval_ms = d.get("heartbeat_interval", 41250)
+
+                                    async def heartbeat_loop(interval: float):
+                                        while True:
+                                            await asyncio.sleep(interval)
+                                            try:
+                                                await ws.send_json({"op": 1, "d": self._gateway_last_seq})
+                                            except Exception:
+                                                break
+
+                                    heartbeat_task = asyncio.create_task(heartbeat_loop(interval_ms / 1000.0))
+
+                                    identify_payload = {
+                                        "op": 2,
+                                        "d": {
+                                            "token": token,
+                                            "intents": 3276799,
+                                            "properties": {
+                                                "os": "linux",
+                                                "browser": "UnAI-Discord",
+                                                "device": "UnAI-Discord"
+                                            }
+                                        }
+                                    }
+                                    await ws.send_json(identify_payload)
+
+                                # OP 1 Heartbeat Request from Gateway -> Respond immediately
+                                elif op == 1:
+                                    await ws.send_json({"op": 1, "d": self._gateway_last_seq})
+
+                                # OP 0 Dispatch Event
+                                elif op == 0:
+                                    my_id = self._user_info.get("id") if self._user_info else None
+
+                                    if t == "MESSAGE_CREATE":
+                                        author = d.get("author", {})
+                                        author_id = author.get("id")
+                                        if my_id and author_id == my_id:
+                                            continue  # Ignore self messages
+
+                                        guild_id = d.get("guild_id")
+                                        mentions = d.get("mentions", [])
+                                        is_dm = guild_id is None
+                                        is_mentioned = any(m.get("id") == my_id for m in mentions) if my_id else False
+
+                                        notif_type = "dm" if is_dm else ("mention" if is_mentioned else "message")
+                                        notif = {
+                                            "id": d.get("id"),
+                                            "type": notif_type,
+                                            "channel_id": d.get("channel_id"),
+                                            "guild_id": guild_id,
+                                            "author": author.get("username"),
+                                            "author_global_name": author.get("global_name"),
+                                            "author_id": author_id,
+                                            "content": d.get("content", ""),
+                                            "timestamp": d.get("timestamp"),
+                                            "attachments_count": len(d.get("attachments", [])),
+                                            "read": False,
+                                        }
+                                        self._add_notification(notif)
+
+                                    elif t == "VOICE_STATE_UPDATE":
+                                        user_id = d.get("user_id")
+                                        if my_id and user_id == my_id:
+                                            continue
+                                        channel_id = d.get("channel_id")
+                                        member = d.get("member", {}).get("user", {})
+                                        notif = {
+                                            "id": f"voice_{user_id}_{channel_id}_{datetime.datetime.now().timestamp()}",
+                                            "type": "voice_state",
+                                            "user_id": user_id,
+                                            "username": member.get("username"),
+                                            "channel_id": channel_id,
+                                            "guild_id": d.get("guild_id"),
+                                            "mute": d.get("mute", False),
+                                            "deaf": d.get("deaf", False),
+                                            "self_mute": d.get("self_mute", False),
+                                            "self_deaf": d.get("self_deaf", False),
+                                            "timestamp": datetime.datetime.now().isoformat(),
+                                            "read": False,
+                                        }
+                                        self._add_notification(notif)
+
+                                    elif t == "MESSAGE_REACTION_ADD":
+                                        user_id = d.get("user_id")
+                                        if my_id and user_id == my_id:
+                                            continue
+                                        emoji = d.get("emoji", {}).get("name")
+                                        notif = {
+                                            "id": f"react_{user_id}_{d.get('message_id')}_{emoji}",
+                                            "type": "reaction",
+                                            "user_id": user_id,
+                                            "channel_id": d.get("channel_id"),
+                                            "guild_id": d.get("guild_id"),
+                                            "message_id": d.get("message_id"),
+                                            "emoji": emoji,
+                                            "timestamp": datetime.datetime.now().isoformat(),
+                                            "read": False,
+                                        }
+                                        self._add_notification(notif)
+
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+
+                        if heartbeat_task:
+                            heartbeat_task.cancel()
+
+            except Exception:
+                pass
+            finally:
+                self._gateway_connected = False
+                self._gateway_ws = None
+                await asyncio.sleep(5.0)  # Reconnect delay
 
     # ====================================================================
     # Auth Tools (ADR-0004)
@@ -944,3 +1119,87 @@ class DiscordWorkspace(Workspace):
             target_channel_id = recipient_id
 
         return await self.messages_send(channel_id=target_channel_id, content=content, reply_to=reply_to, file_path=file_path)
+
+    @tool(
+        "discord.gateway.connect",
+        description="Start real-time WebSocket connection to Discord Gateway v10 to receive live notifications (DMs, mentions, voice events, reactions)",
+    )
+    async def gateway_connect(self, reason: Optional[str] = None) -> str:
+        if not self._token:
+            raise RuntimeError("Not logged in. Call discord.login(token) first.")
+        if self._gateway_task and not self._gateway_task.done():
+            return "Discord Gateway WebSocket is already connected and listening for live events."
+
+        self._gateway_task = asyncio.create_task(self._gateway_listener())
+        await asyncio.sleep(1.0)
+        return "Connected to Discord Gateway WebSocket successfully. Real-time events and notifications are active."
+
+    @tool(
+        "discord.gateway.disconnect",
+        description="Disconnect from Discord Gateway WebSocket listener",
+    )
+    async def gateway_disconnect(self, reason: Optional[str] = None) -> str:
+        if self._gateway_task:
+            self._gateway_task.cancel()
+            self._gateway_task = None
+        self._gateway_connected = False
+        self._gateway_ws = None
+        return "Disconnected from Discord Gateway WebSocket."
+
+    @tool(
+        "discord.gateway.status",
+        description="Get current status of Discord Gateway live connection and notification cache size",
+    )
+    async def gateway_status(self, reason: Optional[str] = None) -> Dict[str, Any]:
+        unread_count = sum(1 for n in self._notifications_cache if not n.get("read"))
+        return {
+            "connected": self._gateway_connected,
+            "listening": bool(self._gateway_task and not self._gateway_task.done()),
+            "cached_notifications_total": len(self._notifications_cache),
+            "unread_notifications_count": unread_count,
+            "info": "Gateway status active" if self._gateway_connected else "Gateway disconnected. Use discord.gateway.connect to start live stream.",
+        }
+
+    @tool(
+        "discord.notifications.feed",
+        description="Read cached real-time notifications (DMs, mentions, reactions, voice_state events). Automatically marks returned items as read.",
+        arguments={
+            "unread_only": {"type": "boolean", "description": "Filter to return only unread notifications", "default": True},
+            "type_filter": {"type": "string", "description": "Optional type filter: 'dm', 'mention', 'message', 'voice_state', 'reaction'", "default": ""},
+            "limit": {"type": "integer", "description": "Max notifications to return (default 20)", "default": 20}
+        },
+    )
+    async def notifications_feed(
+        self, unread_only: bool = True, type_filter: str = "", limit: int = 20, reason: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        result = []
+        for n in self._notifications_cache:
+            if unread_only and n.get("read"):
+                continue
+            if type_filter and n.get("type") != type_filter.lower():
+                continue
+            result.append(n)
+            n["read"] = True
+            if len(result) >= limit:
+                break
+
+        self._save_notifications_cache()
+        return result
+
+    @tool(
+        "discord.notifications.clear",
+        description="Clear cached notifications list or delete a specific notification by ID",
+        arguments={
+            "notification_id": {"type": "string", "description": "Optional specific notification ID to remove. If empty, clears all notifications.", "default": ""}
+        },
+    )
+    async def notifications_clear(self, notification_id: str = "", reason: Optional[str] = None) -> str:
+        if notification_id:
+            self._notifications_cache = [n for n in self._notifications_cache if n.get("id") != notification_id]
+            msg = f"Notification '{notification_id}' cleared."
+        else:
+            self._notifications_cache.clear()
+            msg = "All cached notifications cleared."
+
+        self._save_notifications_cache()
+        return msg
