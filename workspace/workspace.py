@@ -255,6 +255,13 @@ class DiscordWorkspace(Workspace):
 
                                 # OP 0 Dispatch Event
                                 elif op == 0:
+                                    if t == "READY":
+                                        if d.get("user"):
+                                            self._user_info = d.get("user")
+                                        # Send presence update right after READY
+                                        p_payload = {"op": 3, "d": self._build_presence_payload()}
+                                        await ws.send_json(p_payload)
+
                                     my_id = self._user_info.get("id") if self._user_info else None
 
                                     if t == "MESSAGE_CREATE":
@@ -794,7 +801,18 @@ class DiscordWorkspace(Workspace):
         },
     )
     async def messages_get(self, channel_id: str, message_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
-        m = await self._api_request("GET", f"/channels/{channel_id}/messages/{message_id}")
+        try:
+            m = await self._api_request("GET", f"/channels/{channel_id}/messages/{message_id}")
+        except RuntimeError as e:
+            if "Only bots" in str(e) or "403" in str(e):
+                msgs = await self._api_request("GET", f"/channels/{channel_id}/messages", params={"limit": 1, "around": message_id})
+                if msgs and isinstance(msgs, list):
+                    m = msgs[0]
+                else:
+                    raise e
+            else:
+                raise e
+
         author = m.get("author", {})
         return {
             "id": m.get("id"),
