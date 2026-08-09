@@ -365,10 +365,21 @@ class DiscordWorkspace(Workspace):
         }
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{DISCORD_API_BASE}/users/@me", headers=headers) as resp:
-                if resp.status >= 400:
+                if resp.status == 401 and not (clean_token.startswith("Bot ") or clean_token.startswith("Bearer ")):
+                    bot_auth_header = f"Bot {clean_token}"
+                    headers["Authorization"] = bot_auth_header
+                    async with session.get(f"{DISCORD_API_BASE}/users/@me", headers=headers) as resp2:
+                        if resp2.status == 200:
+                            clean_token = bot_auth_header
+                            user_info = await resp2.json()
+                        else:
+                            txt = await resp.text()
+                            raise RuntimeError(f"Failed to authenticate Discord token ({resp.status}): {txt}")
+                elif resp.status >= 400:
                     txt = await resp.text()
                     raise RuntimeError(f"Failed to authenticate Discord token ({resp.status}): {txt}")
-                user_info = await resp.json()
+                else:
+                    user_info = await resp.json()
 
         self._token = clean_token
         self._user_info = user_info
