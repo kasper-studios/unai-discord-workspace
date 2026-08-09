@@ -7,6 +7,7 @@ messages with attachments, sending messages, replies, member lookup, and notific
 Follows ADR-0004 for one-shot login tool state management.
 """
 
+import asyncio
 import base64
 import json
 import os
