@@ -173,9 +173,13 @@ class DiscordWorkspace(Workspace):
             raise RuntimeError("Discord token is not set. Please call discord.login(token) first.")
         token = self._token.strip()
         auth_header = token if token.startswith("Bot ") or token.startswith("Bearer ") else token
+        if self.is_bot:
+            ua = "DiscordBot (https://github.com/kasper-studios/UnAI, 1.0)"
+        else:
+            ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 UnAI-Discord/1.0"
         return {
             "Authorization": auth_header,
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 UnAI-Discord/1.0",
+            "User-Agent": ua,
         }
 
     async def _api_request(
@@ -368,16 +372,19 @@ class DiscordWorkspace(Workspace):
     )
     async def login(self, token: str, reason: Optional[str] = None) -> str:
         clean_token = token.strip()
-        auth_header = clean_token if clean_token.startswith("Bot ") or clean_token.startswith("Bearer ") else clean_token
+        is_bot_token = clean_token.startswith("Bot ")
+        auth_header = clean_token if is_bot_token or clean_token.startswith("Bearer ") else clean_token
+        ua = "DiscordBot (https://github.com/kasper-studios/UnAI, 1.0)" if is_bot_token else "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 UnAI-Discord/1.0"
         headers = {
             "Authorization": auth_header,
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 UnAI-Discord/1.0",
+            "User-Agent": ua,
         }
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{DISCORD_API_BASE}/users/@me", headers=headers) as resp:
                 if resp.status == 401 and not (clean_token.startswith("Bot ") or clean_token.startswith("Bearer ")):
                     bot_auth_header = f"Bot {clean_token}"
                     headers["Authorization"] = bot_auth_header
+                    headers["User-Agent"] = "DiscordBot (https://github.com/kasper-studios/UnAI, 1.0)"
                     async with session.get(f"{DISCORD_API_BASE}/users/@me", headers=headers) as resp2:
                         if resp2.status == 200:
                             clean_token = bot_auth_header
