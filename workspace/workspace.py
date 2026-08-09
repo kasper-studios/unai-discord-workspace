@@ -58,8 +58,50 @@ class DiscordWorkspace(Workspace):
         self._gateway_connected: bool = False
         self._gateway_last_seq: Optional[int] = None
         self._notifications_cache: List[Dict[str, Any]] = []
+        self._current_presence: Optional[Dict[str, Any]] = None
         self._load_saved_token()
         self._load_notifications_cache()
+
+    def _build_presence_payload(self) -> Dict[str, Any]:
+        p = self._current_presence or {}
+        status = p.get("status", "online")
+        act_type_str = p.get("activity_type", "custom").lower()
+        act_name = p.get("activity_name", "")
+        emoji_name = p.get("emoji", "")
+
+        type_map = {
+            "playing": 0,
+            "streaming": 1,
+            "listening": 2,
+            "watching": 3,
+            "custom": 4,
+            "competing": 5,
+        }
+        act_type = type_map.get(act_type_str, 4)
+
+        activities = []
+        if act_name or emoji_name or act_type_str == "custom":
+            act_obj: Dict[str, Any] = {
+                "name": "Custom Status" if act_type == 4 else act_name,
+                "type": act_type,
+            }
+            if act_type == 4:
+                if act_name:
+                    act_obj["state"] = act_name
+                if emoji_name:
+                    act_obj["emoji"] = {"name": emoji_name}
+            else:
+                if act_name:
+                    act_obj["state"] = act_name
+
+            activities.append(act_obj)
+
+        return {
+            "since": None,
+            "activities": activities,
+            "status": status,
+            "afk": status == "idle",
+        }
 
     def _load_notifications_cache(self) -> None:
         nf = _get_data_dir() / "notifications_cache.json"
@@ -185,6 +227,7 @@ class DiscordWorkspace(Workspace):
                                         "d": {
                                             "token": token,
                                             "intents": 3276799,
+                                            "presence": self._build_presence_payload(),
                                             "properties": {
                                                 "os": "linux",
                                                 "browser": "UnAI-Discord",
@@ -1203,3 +1246,49 @@ class DiscordWorkspace(Workspace):
 
         self._save_notifications_cache()
         return msg
+
+    @tool(
+        "discord.presence.update",
+        description="Update your Discord online status (online, dnd, idle, invisible) and custom activity/status with optional emoji and text",
+        arguments={
+            "status": {"type": "string", "description": "Online status: 'online', 'dnd' (Do Not Disturb), 'idle', 'invisible'", "default": "online"},
+            "activity_type": {"type": "string", "description": "Activity type: 'custom', 'playing', 'listening', 'watching', 'streaming', 'competing'", "default": "custom"},
+            "activity_name": {"type": "string", "description": "Custom status text or game/stream name", "default": ""},
+            "emoji": {"type": "string", "description": "Optional emoji for custom status (e.g. '🤖', '🔥', '⚡')", "default": ""}
+        },
+    )
+    async def presence_update(
+        self,
+        status: str = "online",
+        activity_type: str = "custom",
+        activity_name: str = "",
+        emoji: str = "",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        valid_statuses = ["online", "dnd", "idle", "invisible"]
+        status_clean = status.lower().strip()
+        if status_clean not in valid_statuses:
+            raise RuntimeError(f"Invalid status '{status}'. Must be one of: {valid_statuses}")
+
+        self._current_presence = {
+            "status": status_clean,
+            "activity_type": activity_type.lower().strip(),
+            "activity_name": activity_name,
+            "emoji": emoji,
+        }
+
+        if self._gateway_ws and not self._gateway_ws.closed:
+            payload = {"op": 3, "d": self._build_presence_payload()}
+            await self._gateway_ws.send_json(payload)
+            info_str = f"Presence updated to '{status_clean}' and broadcasted live over Discord Gateway WebSocket."
+        else:
+            info_str = f"Presence saved as '{status_clean}'. Will be broadcasted live as soon as discord.gateway.connect is active."
+
+        return {
+            "status": status_clean,
+            "activity_type": activity_type,
+            "activity_name": activity_name,
+            "emoji": emoji,
+            "gateway_connected": self._gateway_connected,
+            "info": info_str,
+        }
