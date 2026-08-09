@@ -1,0 +1,8 @@
+id = "discord"
+name = "Discord Workspace"
+version = "1.0.0"
+entry = "run.py"
+api = 1
+author = "kasper-studios"
+description = "Native Discord workspace for autonomous AI agents — messages, channels, servers, members, notifications, attachments"
+default_enabled = true
