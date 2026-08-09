@@ -203,6 +203,223 @@ class DiscordWorkspace(Workspace):
         return out
 
     @tool(
+        "discord.servers.my_member",
+        description="Get your own member profile, nickname, roles, joined_at date, and permissions on a specific server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"}
+        },
+    )
+    async def servers_my_member(self, guild_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        member = await self._api_request("GET", f"/guilds/{guild_id}/members/@me")
+        user = member.get("user", {})
+        return {
+            "guild_id": guild_id,
+            "id": user.get("id"),
+            "username": user.get("username"),
+            "global_name": user.get("global_name"),
+            "nickname": member.get("nick"),
+            "roles": member.get("roles", []),
+            "joined_at": member.get("joined_at"),
+            "premium_since": member.get("premium_since"),
+            "permissions": member.get("permissions"),
+            "avatar": member.get("avatar"),
+            "deaf": member.get("deaf", False),
+            "mute": member.get("mute", False),
+            "pending": member.get("pending", False),
+        }
+
+    @tool(
+        "discord.servers.get",
+        description="Get detailed information about a Discord server (guild) including owner, description, roles, icon, and member counts",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"}
+        },
+    )
+    async def servers_get(self, guild_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        g = await self._api_request("GET", f"/guilds/{guild_id}?with_counts=true")
+        roles = [
+            {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "color": r.get("color"),
+                "position": r.get("position"),
+                "permissions": r.get("permissions"),
+            }
+            for r in g.get("roles", [])
+        ]
+        return {
+            "id": g.get("id"),
+            "name": g.get("name"),
+            "description": g.get("description"),
+            "owner_id": g.get("owner_id"),
+            "icon": g.get("icon"),
+            "banner": g.get("banner"),
+            "splash": g.get("splash"),
+            "approximate_member_count": g.get("approximate_member_count"),
+            "approximate_presence_count": g.get("approximate_presence_count"),
+            "preferred_locale": g.get("preferred_locale"),
+            "system_channel_id": g.get("system_channel_id"),
+            "afk_channel_id": g.get("afk_channel_id"),
+            "afk_timeout": g.get("afk_timeout"),
+            "roles": roles,
+        }
+
+    @tool(
+        "discord.servers.update",
+        description="Update server (guild) settings such as name, description, icon, banner, system_channel_id, or afk settings (requires MANAGE_GUILD permission)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "name": {"type": "string", "description": "New server name", "default": ""},
+            "description": {"type": "string", "description": "New server description", "default": ""},
+            "icon_path": {"type": "string", "description": "Local image file path to upload as server icon", "default": ""},
+            "banner_path": {"type": "string", "description": "Local image file path to upload as server banner", "default": ""},
+            "system_channel_id": {"type": "string", "description": "Channel ID for system messages", "default": ""},
+            "afk_channel_id": {"type": "string", "description": "Voice channel ID for AFK users", "default": ""},
+            "afk_timeout": {"type": "integer", "description": "AFK timeout in seconds (60, 300, 900, 1800, 3600)", "default": 0}
+        },
+    )
+    async def servers_update(
+        self,
+        guild_id: str,
+        name: str = "",
+        description: str = "",
+        icon_path: str = "",
+        banner_path: str = "",
+        system_channel_id: str = "",
+        afk_channel_id: str = "",
+        afk_timeout: int = 0,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if name:
+            payload["name"] = name
+        if description:
+            payload["description"] = description
+        if icon_path:
+            payload["icon"] = _file_to_base64_data_uri(icon_path)
+        if banner_path:
+            payload["banner"] = _file_to_base64_data_uri(banner_path)
+        if system_channel_id:
+            payload["system_channel_id"] = system_channel_id
+        if afk_channel_id:
+            payload["afk_channel_id"] = afk_channel_id
+        if afk_timeout > 0:
+            payload["afk_timeout"] = afk_timeout
+
+        if not payload:
+            raise RuntimeError("At least one setting parameter must be specified to update server.")
+
+        g = await self._api_request("PATCH", f"/guilds/{guild_id}", json_data=payload)
+        return {
+            "id": g.get("id"),
+            "name": g.get("name"),
+            "description": g.get("description"),
+            "icon": g.get("icon"),
+            "banner": g.get("banner"),
+            "info": "Server settings updated successfully.",
+        }
+
+    @tool(
+        "discord.channels.create",
+        description="Create a new text, voice, or category channel in a server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "name": {"type": "string", "description": "Channel name"},
+            "type": {"type": "string", "description": "Channel type: 'text', 'voice', 'category', 'news', 'forum'", "default": "text"},
+            "topic": {"type": "string", "description": "Optional channel topic", "default": ""},
+            "parent_id": {"type": "string", "description": "Optional category ID to place channel in", "default": ""},
+            "nsfw": {"type": "boolean", "description": "Whether channel is NSFW", "default": False}
+        },
+    )
+    async def channels_create(
+        self,
+        guild_id: str,
+        name: str,
+        type: str = "text",
+        topic: str = "",
+        parent_id: str = "",
+        nsfw: bool = False,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        type_str_map = {"text": 0, "voice": 2, "category": 4, "news": 5, "forum": 15}
+        ctype = type_str_map.get(type.lower(), 0)
+
+        payload: Dict[str, Any] = {"name": name, "type": ctype}
+        if topic:
+            payload["topic"] = topic
+        if parent_id:
+            payload["parent_id"] = parent_id
+        if nsfw:
+            payload["nsfw"] = nsfw
+
+        c = await self._api_request("POST", f"/guilds/{guild_id}/channels", json_data=payload)
+        return {
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "type": type,
+            "guild_id": c.get("guild_id"),
+            "parent_id": c.get("parent_id"),
+            "info": f"Channel '{name}' created successfully in guild '{guild_id}'.",
+        }
+
+    @tool(
+        "discord.channels.update",
+        description="Update channel properties (name, topic, parent_id/category, position, or nsfw)",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID to update"},
+            "name": {"type": "string", "description": "New channel name", "default": ""},
+            "topic": {"type": "string", "description": "New channel topic", "default": ""},
+            "parent_id": {"type": "string", "description": "New category ID", "default": ""},
+            "position": {"type": "integer", "description": "New position integer", "default": -1},
+            "nsfw": {"type": "boolean", "description": "Set NSFW flag", "default": False}
+        },
+    )
+    async def channels_update(
+        self,
+        channel_id: str,
+        name: str = "",
+        topic: str = "",
+        parent_id: str = "",
+        position: int = -1,
+        nsfw: bool = False,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if name:
+            payload["name"] = name
+        if topic:
+            payload["topic"] = topic
+        if parent_id:
+            payload["parent_id"] = parent_id
+        if position >= 0:
+            payload["position"] = position
+        if nsfw:
+            payload["nsfw"] = nsfw
+
+        if not payload:
+            raise RuntimeError("At least one parameter must be specified to update channel.")
+
+        c = await self._api_request("PATCH", f"/channels/{channel_id}", json_data=payload)
+        return {
+            "id": c.get("id"),
+            "name": c.get("name"),
+            "topic": c.get("topic"),
+            "parent_id": c.get("parent_id"),
+            "info": f"Channel '{channel_id}' updated successfully.",
+        }
+
+    @tool(
+        "discord.channels.delete",
+        description="Delete a channel or category from a Discord server",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID to delete"}
+        },
+    )
+    async def channels_delete(self, channel_id: str, reason: Optional[str] = None) -> str:
+        await self._api_request("DELETE", f"/channels/{channel_id}")
+        return f"Channel '{channel_id}' deleted successfully."
+
+    @tool(
         "discord.channels.list",
         description="List text/voice channels of a server (guild) or list DM channels if guild_id is omitted",
         arguments={
