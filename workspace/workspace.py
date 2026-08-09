@@ -43,6 +43,20 @@ def _get_data_dir() -> Path:
     return d
 
 
+def _resolve_gateway_properties(platform: str) -> Dict[str, str]:
+    p = platform.lower().strip()
+    if p in ["mobile", "phone", "android"]:
+        return {"os": "Android", "browser": "Discord Android", "device": "Android"}
+    elif p in ["ios", "iphone"]:
+        return {"os": "iOS", "browser": "Discord iOS", "device": "iPhone"}
+    elif p in ["desktop", "pc", "app"]:
+        return {"os": "Linux", "browser": "Discord Client", "device": "discord-desktop"}
+    elif p in ["console", "embedded"]:
+        return {"os": "Linux", "browser": "Discord Embedded", "device": "Console"}
+    else:  # web / browser
+        return {"os": "Linux", "browser": "Chrome", "device": ""}
+
+
 def _get_token_file() -> Path:
     return _get_data_dir() / "session.json"
 
@@ -60,6 +74,7 @@ class DiscordWorkspace(Workspace):
         self._gateway_last_seq: Optional[int] = None
         self._notifications_cache: List[Dict[str, Any]] = []
         self._current_presence: Optional[Dict[str, Any]] = None
+        self._platform: str = "desktop"
         self._load_saved_token()
         self._load_notifications_cache()
 
@@ -229,11 +244,7 @@ class DiscordWorkspace(Workspace):
                                             "token": token,
                                             "intents": 3276799,
                                             "presence": self._build_presence_payload(),
-                                            "properties": {
-                                                "os": "linux",
-                                                "browser": "UnAI-Discord",
-                                                "device": "UnAI-Discord"
-                                            }
+                                            "properties": _resolve_gateway_properties(getattr(self, "_platform", "desktop"))
                                         }
                                     }
                                     await ws.send_json(identify_payload)
@@ -1166,17 +1177,32 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.gateway.connect",
-        description="Start real-time WebSocket connection to Discord Gateway v10 to receive live notifications (DMs, mentions, voice events, reactions)",
+        description="Start real-time WebSocket connection to Discord Gateway v10. Choose client platform display: 'desktop' (PC icon), 'mobile' (Phone icon), 'web' (Browser icon), or 'console'",
+        arguments={
+            "platform": {"type": "string", "description": "Client platform display: 'desktop' (PC), 'mobile' (Phone), 'web' (Browser), 'console'", "default": "desktop"}
+        },
     )
-    async def gateway_connect(self, reason: Optional[str] = None) -> str:
+    async def gateway_connect(self, platform: str = "desktop", reason: Optional[str] = None) -> str:
         if not self._token:
             raise RuntimeError("Not logged in. Call discord.login(token) first.")
+        self._platform = platform
         if self._gateway_task and not self._gateway_task.done():
-            return "Discord Gateway WebSocket is already connected and listening for live events."
+            if self._gateway_ws and not self._gateway_ws.closed:
+                payload = {
+                    "op": 2,
+                    "d": {
+                        "token": self._token.strip(),
+                        "intents": 3276799,
+                        "presence": self._build_presence_payload(),
+                        "properties": _resolve_gateway_properties(platform),
+                    },
+                }
+                await self._gateway_ws.send_json(payload)
+            return f"Discord Gateway WebSocket updated to platform '{platform}'."
 
         self._gateway_task = asyncio.create_task(self._gateway_listener())
         await asyncio.sleep(1.0)
-        return "Connected to Discord Gateway WebSocket successfully. Real-time events and notifications are active."
+        return f"Connected to Discord Gateway WebSocket successfully with platform '{platform}'. Real-time events and notifications are active."
 
     @tool(
         "discord.gateway.disconnect",
