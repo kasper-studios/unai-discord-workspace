@@ -416,3 +416,161 @@ class DiscordWorkspace(Workspace):
             "bot": u.get("bot", False),
             "accent_color": u.get("accent_color"),
         }
+
+    @tool(
+        "discord.messages.edit",
+        description="Edit content of a previously sent Discord message",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"},
+            "message_id": {"type": "string", "description": "Message ID to edit"},
+            "content": {"type": "string", "description": "New message content"}
+        },
+    )
+    async def messages_edit(
+        self, channel_id: str, message_id: str, content: str, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        res = await self._api_request("PATCH", f"/channels/{channel_id}/messages/{message_id}", json_data={"content": content})
+        return {
+            "id": res.get("id"),
+            "channel_id": res.get("channel_id"),
+            "content": res.get("content"),
+            "edited_timestamp": res.get("edited_timestamp"),
+            "info": "Message edited successfully",
+        }
+
+    @tool(
+        "discord.messages.delete",
+        description="Delete a Discord message",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"},
+            "message_id": {"type": "string", "description": "Message ID to delete"}
+        },
+    )
+    async def messages_delete(
+        self, channel_id: str, message_id: str, reason: Optional[str] = None
+    ) -> str:
+        await self._api_request("DELETE", f"/channels/{channel_id}/messages/{message_id}")
+        return f"Message '{message_id}' deleted successfully from channel '{channel_id}'."
+
+    @tool(
+        "discord.messages.react",
+        description="Add an emoji reaction to a Discord message",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"},
+            "message_id": {"type": "string", "description": "Message ID"},
+            "emoji": {"type": "string", "description": "Emoji to react with (e.g. '👍', '❤️', '🔥', or 'name:id')"}
+        },
+    )
+    async def messages_react(
+        self, channel_id: str, message_id: str, emoji: str, reason: Optional[str] = None
+    ) -> str:
+        import urllib.parse
+        encoded_emoji = urllib.parse.quote(emoji)
+        await self._api_request("PUT", f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me")
+        return f"Reacted with '{emoji}' to message '{message_id}' successfully."
+
+    @tool(
+        "discord.messages.unreact",
+        description="Remove your emoji reaction from a Discord message",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"},
+            "message_id": {"type": "string", "description": "Message ID"},
+            "emoji": {"type": "string", "description": "Emoji reaction to remove"}
+        },
+    )
+    async def messages_unreact(
+        self, channel_id: str, message_id: str, emoji: str, reason: Optional[str] = None
+    ) -> str:
+        import urllib.parse
+        encoded_emoji = urllib.parse.quote(emoji)
+        await self._api_request("DELETE", f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me")
+        return f"Removed reaction '{emoji}' from message '{message_id}' successfully."
+
+    @tool(
+        "discord.messages.pins",
+        description="List pinned messages in a Discord channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"}
+        },
+    )
+    async def messages_pins(
+        self, channel_id: str, reason: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        pins = await self._api_request("GET", f"/channels/{channel_id}/pins")
+        out = []
+        for m in pins:
+            author = m.get("author", {})
+            out.append({
+                "id": m.get("id"),
+                "author": author.get("username"),
+                "content": m.get("content", ""),
+                "timestamp": m.get("timestamp"),
+            })
+        return out
+
+    @tool(
+        "discord.messages.pin",
+        description="Pin a message in a Discord channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"},
+            "message_id": {"type": "string", "description": "Message ID to pin"}
+        },
+    )
+    async def messages_pin(
+        self, channel_id: str, message_id: str, reason: Optional[str] = None
+    ) -> str:
+        await self._api_request("PUT", f"/channels/{channel_id}/pins/{message_id}")
+        return f"Message '{message_id}' pinned successfully."
+
+    @tool(
+        "discord.messages.unpin",
+        description="Unpin a message in a Discord channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"},
+            "message_id": {"type": "string", "description": "Message ID to unpin"}
+        },
+    )
+    async def messages_unpin(
+        self, channel_id: str, message_id: str, reason: Optional[str] = None
+    ) -> str:
+        await self._api_request("DELETE", f"/channels/{channel_id}/pins/{message_id}")
+        return f"Message '{message_id}' unpinned successfully."
+
+    @tool(
+        "discord.typing",
+        description="Trigger typing indicator in a Discord channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID"}
+        },
+    )
+    async def typing(
+        self, channel_id: str, reason: Optional[str] = None
+    ) -> str:
+        await self._api_request("POST", f"/channels/{channel_id}/typing")
+        return f"Typing indicator triggered in channel '{channel_id}'."
+
+    @tool(
+        "discord.messages.search",
+        description="Search messages matching a query in a Discord server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Guild (server) ID"},
+            "content": {"type": "string", "description": "Search keyword or text pattern"}
+        },
+    )
+    async def messages_search(
+        self, guild_id: str, content: str, reason: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        res = await self._api_request("GET", f"/guilds/{guild_id}/messages/search", params={"content": content})
+        messages = res.get("messages", [])
+        out = []
+        for group in messages:
+            for m in group:
+                author = m.get("author", {})
+                out.append({
+                    "id": m.get("id"),
+                    "channel_id": m.get("channel_id"),
+                    "author": author.get("username"),
+                    "content": m.get("content", ""),
+                    "timestamp": m.get("timestamp"),
+                })
+        return out
