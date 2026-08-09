@@ -43,7 +43,9 @@ def _get_data_dir() -> Path:
     return d
 
 
-def _resolve_gateway_properties(platform: str) -> Dict[str, str]:
+def _resolve_gateway_properties(platform: str, is_bot: bool = False) -> Dict[str, str]:
+    if is_bot:
+        return {"os": "Linux", "browser": "UnAI-Discord-Bot", "device": "UnAI-Discord-Bot"}
     p = platform.lower().strip()
     if p in ["mobile", "phone", "android"]:
         return {"os": "Android", "browser": "Discord Android", "device": "Android"}
@@ -158,6 +160,14 @@ class DiscordWorkspace(Workspace):
     def is_logged_in(self) -> bool:
         return bool(self._token)
 
+    @property
+    def is_bot(self) -> bool:
+        if self._token and self._token.strip().startswith("Bot "):
+            return True
+        if self._user_info and self._user_info.get("bot"):
+            return True
+        return False
+
     def _get_headers(self) -> Dict[str, str]:
         if not self._token:
             raise RuntimeError("Discord token is not set. Please call discord.login(token) first.")
@@ -244,7 +254,7 @@ class DiscordWorkspace(Workspace):
                                             "token": token,
                                             "intents": 3276799,
                                             "presence": self._build_presence_payload(),
-                                            "properties": _resolve_gateway_properties(getattr(self, "_platform", "desktop"))
+                                            "properties": _resolve_gateway_properties(getattr(self, "_platform", "desktop"), is_bot=self.is_bot)
                                         }
                                     }
                                     await ws.send_json(identify_payload)
@@ -1206,15 +1216,16 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.gateway.connect",
-        description="Start real-time WebSocket connection to Discord Gateway v10. Choose client platform display: 'desktop' (PC icon), 'mobile' (Phone icon), 'web' (Browser icon), or 'console'",
+        description="Start real-time WebSocket connection to Discord Gateway v10. Platform selection ('desktop', 'mobile', 'web') applies to user accounts (bots use standard bot properties).",
         arguments={
-            "platform": {"type": "string", "description": "Client platform display: 'desktop' (PC), 'mobile' (Phone), 'web' (Browser), 'console'", "default": "desktop"}
+            "platform": {"type": "string", "description": "Optional client platform for user accounts: 'desktop', 'mobile', 'web', 'console'", "default": "desktop"}
         },
     )
     async def gateway_connect(self, platform: str = "desktop", reason: Optional[str] = None) -> str:
         if not self._token:
             raise RuntimeError("Not logged in. Call discord.login(token) first.")
         self._platform = platform
+        props = _resolve_gateway_properties(platform, is_bot=self.is_bot)
         if self._gateway_task and not self._gateway_task.done():
             if self._gateway_ws and not self._gateway_ws.closed:
                 payload = {
@@ -1223,15 +1234,15 @@ class DiscordWorkspace(Workspace):
                         "token": self._token.strip(),
                         "intents": 3276799,
                         "presence": self._build_presence_payload(),
-                        "properties": _resolve_gateway_properties(platform),
+                        "properties": props,
                     },
                 }
                 await self._gateway_ws.send_json(payload)
-            return f"Discord Gateway WebSocket updated to platform '{platform}'."
+            return "Discord Gateway WebSocket updated for Bot account." if self.is_bot else f"Discord Gateway WebSocket updated to platform '{platform}'."
 
         self._gateway_task = asyncio.create_task(self._gateway_listener())
         await asyncio.sleep(1.0)
-        return f"Connected to Discord Gateway WebSocket successfully with platform '{platform}'. Real-time events and notifications are active."
+        return "Connected to Discord Gateway WebSocket successfully as Bot." if self.is_bot else f"Connected to Discord Gateway WebSocket successfully with platform '{platform}'."
 
     @tool(
         "discord.gateway.disconnect",
