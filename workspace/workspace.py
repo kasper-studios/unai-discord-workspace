@@ -63,6 +63,70 @@ def _get_token_file() -> Path:
     return _get_data_dir() / "session.json"
 
 
+class VoiceManager:
+    """Voice Connection & Media Streaming Manager for Discord channels."""
+
+    def __init__(self):
+        self._py_client: Optional[Any] = None
+
+    async def get_py_client(self, token: str) -> Any:
+        import discord
+        from ctypes.util import find_library
+
+        if not discord.opus.is_loaded():
+            lib = find_library("opus")
+            if lib:
+                discord.opus.load_opus(lib)
+
+        if self._py_client is None or self._py_client.is_closed():
+            intents = discord.Intents.default()
+            intents.voice_states = True
+            intents.guilds = True
+            client = discord.Client(intents=intents)
+
+            clean_token = token.replace("Bot ", "").strip()
+            is_bot = token.startswith("Bot ")
+
+            ready_event = asyncio.Event()
+
+            @client.event
+            async def on_ready():
+                ready_event.set()
+
+            asyncio.create_task(client.start(clean_token, bot=is_bot))
+            try:
+                await asyncio.wait_for(ready_event.wait(), timeout=8.0)
+            except Exception:
+                pass
+            self._py_client = client
+
+        return self._py_client
+
+    async def get_or_connect(self, token: str, channel_id_str: str) -> Any:
+        client = await self.get_py_client(token)
+        cid = int(channel_id_str)
+
+        channel = client.get_channel(cid)
+        if channel is None:
+            for g in client.guilds:
+                ch = g.get_channel(cid)
+                if ch:
+                    channel = ch
+                    break
+
+        if channel is None:
+            raise RuntimeError(f"Voice channel or Guild '{channel_id_str}' not found.")
+
+        guild = channel.guild
+        if guild.voice_client and guild.voice_client.is_connected():
+            if guild.voice_client.channel.id != channel.id:
+                await guild.voice_client.move_to(channel)
+            return guild.voice_client
+
+        vc = await channel.connect(reconnect=True, timeout=15.0)
+        return vc
+
+
 class DiscordWorkspace(Workspace):
     """Native Discord Workspace for autonomous AI agents."""
 
@@ -77,6 +141,7 @@ class DiscordWorkspace(Workspace):
         self._notifications_cache: List[Dict[str, Any]] = []
         self._current_presence: Optional[Dict[str, Any]] = None
         self._platform: str = "desktop"
+        self._voice_manager: VoiceManager = VoiceManager()
         self._load_saved_token()
         self._load_notifications_cache()
 
@@ -1435,3 +1500,167 @@ class DiscordWorkspace(Workspace):
     ) -> str:
         await self._api_request("DELETE", f"/guilds/{guild_id}/emojis/{emoji_id}")
         return f"Custom emoji '{emoji_id}' deleted successfully from guild '{guild_id}'."
+
+    # ====================================================================
+    # Voice Channel & Neural TTS Tools
+    # ====================================================================
+
+    @tool(
+        "discord.voice.voices_list",
+        description="List available neural TTS voices for speech synthesis (Russian, English, etc.)",
+        arguments={
+            "language": {"type": "string", "description": "Optional language code filter (e.g. 'ru', 'en', 'de', 'fr', 'ja')", "default": ""}
+        },
+    )
+    async def voice_voices_list(self, language: str = "", reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        import edge_tts
+        all_voices = await edge_tts.list_voices()
+        out = []
+        lang_clean = language.lower().strip()
+        for v in all_voices:
+            short_name = v.get("ShortName", "")
+            locale = v.get("Locale", "").lower()
+            if lang_clean and not locale.startswith(lang_clean):
+                continue
+            out.append({
+                "short_name": short_name,
+                "gender": v.get("Gender"),
+                "locale": v.get("Locale"),
+                "friendly_name": v.get("FriendlyName"),
+            })
+        return out
+
+    @tool(
+        "discord.voice.join",
+        description="Connect to a Discord Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID"},
+            "mute": {"type": "boolean", "description": "Connect self-muted", "default": False},
+            "deaf": {"type": "boolean", "description": "Connect self-deafened", "default": False}
+        },
+    )
+    async def voice_join(self, channel_id: str, mute: bool = False, deaf: bool = False, reason: Optional[str] = None) -> Dict[str, Any]:
+        vc = await self._voice_manager.get_or_connect(self._token, channel_id)
+        return {
+            "channel_id": str(vc.channel.id),
+            "guild_id": str(vc.guild.id),
+            "connected": vc.is_connected(),
+            "info": f"Connected to Voice Channel '{vc.channel.name}' (ID: {vc.channel.id}).",
+        }
+
+    @tool(
+        "discord.voice.leave",
+        description="Disconnect from a Discord Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID or Server ID"}
+        },
+    )
+    async def voice_leave(self, channel_id: str, reason: Optional[str] = None) -> str:
+        client = await self._voice_manager.get_py_client(self._token)
+        cid = int(channel_id)
+        for g in client.guilds:
+            if g.voice_client and (g.id == cid or g.voice_client.channel.id == cid):
+                vchannel_name = g.voice_client.channel.name
+                await g.voice_client.disconnect(force=True)
+                return f"Disconnected from Voice Channel '{vchannel_name}' in guild '{g.name}'."
+
+        return f"No active voice connection found for ID '{channel_id}'."
+
+    @tool(
+        "discord.voice.play_file",
+        description="Play any local audio or sound file (.mp3, .wav, .ogg, .flac, .m4a) in a Discord Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Target Voice Channel ID or Guild ID"},
+            "file_path": {"type": "string", "description": "Local path to audio file"},
+            "volume": {"type": "number", "description": "Volume level (0.1 to 2.0)", "default": 1.0}
+        },
+    )
+    async def voice_play_file(
+        self,
+        channel_id: str,
+        file_path: str,
+        volume: float = 1.0,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        p = Path(file_path)
+        if not p.exists():
+            raise RuntimeError(f"Audio file not found: {file_path}")
+
+        vc = await self._voice_manager.get_or_connect(self._token, channel_id)
+        if vc.is_playing():
+            vc.stop()
+
+        import discord
+        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(str(p)), volume=volume)
+        vc.play(source)
+
+        return {
+            "channel_id": str(vc.channel.id),
+            "guild_id": str(vc.guild.id),
+            "file_path": str(p),
+            "volume": volume,
+            "info": f"Playing audio file '{p.name}' in voice channel '{vc.channel.name}'.",
+        }
+
+    @tool(
+        "discord.voice.tts",
+        description="Speak text in a Discord Voice Channel using customizable neural TTS (voice, speed rate, pitch, volume)",
+        arguments={
+            "channel_id": {"type": "string", "description": "Target Voice Channel ID or Guild ID"},
+            "text": {"type": "string", "description": "Text to synthesize and speak"},
+            "voice": {"type": "string", "description": "Neural voice name (e.g. 'ru-RU-DmitryNeural', 'ru-RU-SvetlanaNeural', 'en-US-GuyNeural')", "default": "ru-RU-DmitryNeural"},
+            "rate": {"type": "string", "description": "Speed rate adjustment (e.g. '+0%', '+25%', '-15%')", "default": "+0%"},
+            "pitch": {"type": "string", "description": "Pitch adjustment (e.g. '+0Hz', '+15Hz', '-20Hz')", "default": "+0Hz"},
+            "volume": {"type": "string", "description": "Volume adjustment (e.g. '+0%', '+30%')", "default": "+0%"}
+        },
+    )
+    async def voice_tts(
+        self,
+        channel_id: str,
+        text: str,
+        voice: str = "ru-RU-DmitryNeural",
+        rate: str = "+0%",
+        pitch: str = "+0Hz",
+        volume: str = "+0%",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        import edge_tts
+        import tempfile
+        if not text:
+            raise RuntimeError("Text parameter is required for TTS synthesis.")
+
+        temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+        temp_audio_path = temp_audio.name
+        temp_audio.close()
+
+        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
+        await communicate.save(temp_audio_path)
+
+        res = await self.voice_play_file(channel_id=channel_id, file_path=temp_audio_path)
+        res["tts_info"] = {
+            "text": text,
+            "voice": voice,
+            "rate": rate,
+            "pitch": pitch,
+            "volume": volume,
+        }
+        return res
+
+    @tool(
+        "discord.voice.stop",
+        description="Stop current active voice audio playback in Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID or Guild ID"}
+        },
+    )
+    async def voice_stop(self, channel_id: str, reason: Optional[str] = None) -> str:
+        client = await self._voice_manager.get_py_client(self._token)
+        cid = int(channel_id)
+        for g in client.guilds:
+            if g.voice_client and (g.id == cid or g.voice_client.channel.id == cid):
+                if g.voice_client.is_playing():
+                    g.voice_client.stop()
+                    return f"Audio playback stopped in Voice Channel '{g.voice_client.channel.name}'."
+                return f"No audio is currently playing in Voice Channel '{g.voice_client.channel.name}'."
+
+        return f"No active voice connection found for ID '{channel_id}'."
