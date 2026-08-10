@@ -1664,3 +1664,191 @@ class DiscordWorkspace(Workspace):
                 return f"No audio is currently playing in Voice Channel '{g.voice_client.channel.name}'."
 
         return f"No active voice connection found for ID '{channel_id}'."
+
+    # ====================================================================
+    # Roles, Server Moderation, Invites & Threads Tools
+    # ====================================================================
+
+    @tool(
+        "discord.roles.list",
+        description="List all roles on a server (guild) with IDs, colors, and permissions",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"}
+        },
+    )
+    async def roles_list(self, guild_id: str, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        roles = await self._api_request("GET", f"/guilds/{guild_id}/roles")
+        return [
+            {
+                "id": r.get("id"),
+                "name": r.get("name"),
+                "color": r.get("color"),
+                "position": r.get("position"),
+                "permissions": r.get("permissions"),
+                "hoist": r.get("hoist", False),
+                "managed": r.get("managed", False),
+                "mentionable": r.get("mentionable", False),
+            }
+            for r in roles
+        ]
+
+    @tool(
+        "discord.roles.add_to_member",
+        description="Assign a role to a server member by User ID and Role ID",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "user_id": {"type": "string", "description": "Member User ID"},
+            "role_id": {"type": "string", "description": "Role ID to add"}
+        },
+    )
+    async def roles_add_to_member(self, guild_id: str, user_id: str, role_id: str, reason: Optional[str] = None) -> str:
+        await self._api_request("PUT", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}")
+        return f"Role '{role_id}' added to member '{user_id}' in guild '{guild_id}'."
+
+    @tool(
+        "discord.roles.remove_from_member",
+        description="Remove a role from a server member by User ID and Role ID",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "user_id": {"type": "string", "description": "Member User ID"},
+            "role_id": {"type": "string", "description": "Role ID to remove"}
+        },
+    )
+    async def roles_remove_from_member(self, guild_id: str, user_id: str, role_id: str, reason: Optional[str] = None) -> str:
+        await self._api_request("DELETE", f"/guilds/{guild_id}/members/{user_id}/roles/{role_id}")
+        return f"Role '{role_id}' removed from member '{user_id}' in guild '{guild_id}'."
+
+    @tool(
+        "discord.members.kick",
+        description="Kick a member from a server (guild) by User ID (requires KICK_MEMBERS permission)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "user_id": {"type": "string", "description": "User ID to kick"},
+            "reason": {"type": "string", "description": "Reason for kick", "default": ""}
+        },
+    )
+    async def members_kick(self, guild_id: str, user_id: str, reason: str = "", reason_arg: Optional[str] = None) -> str:
+        params = {"reason": reason} if reason else None
+        await self._api_request("DELETE", f"/guilds/{guild_id}/members/{user_id}", params=params)
+        return f"Member '{user_id}' kicked successfully from guild '{guild_id}'."
+
+    @tool(
+        "discord.members.ban",
+        description="Ban a user from a server (guild) by User ID (requires BAN_MEMBERS permission)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "user_id": {"type": "string", "description": "User ID to ban"},
+            "delete_message_days": {"type": "integer", "description": "Number of days of message history to delete (0 to 7)", "default": 0},
+            "reason": {"type": "string", "description": "Reason for ban", "default": ""}
+        },
+    )
+    async def members_ban(
+        self, guild_id: str, user_id: str, delete_message_days: int = 0, reason: str = "", reason_arg: Optional[str] = None
+    ) -> str:
+        payload = {"delete_message_days": max(0, min(delete_message_days, 7))}
+        if reason:
+            payload["reason"] = reason
+        await self._api_request("PUT", f"/guilds/{guild_id}/bans/{user_id}", json_data=payload)
+        return f"User '{user_id}' banned successfully from guild '{guild_id}'."
+
+    @tool(
+        "discord.members.unban",
+        description="Unban a user from a server (guild) by User ID",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"},
+            "user_id": {"type": "string", "description": "User ID to unban"}
+        },
+    )
+    async def members_unban(self, guild_id: str, user_id: str, reason: Optional[str] = None) -> str:
+        await self._api_request("DELETE", f"/guilds/{guild_id}/bans/{user_id}")
+        return f"User '{user_id}' unbanned successfully from guild '{guild_id}'."
+
+    @tool(
+        "discord.invites.create",
+        description="Create an invite link for a channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Channel ID to create invite for"},
+            "max_age": {"type": "integer", "description": "Duration of invite in seconds (0 for infinite, default 86400 = 24h)", "default": 86400},
+            "max_uses": {"type": "integer", "description": "Max number of uses (0 for unlimited)", "default": 0},
+            "unique": {"type": "boolean", "description": "Whether to force creation of a new unique invite code", "default": False}
+        },
+    )
+    async def invites_create(
+        self, channel_id: str, max_age: int = 86400, max_uses: int = 0, unique: bool = False, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        payload = {"max_age": max_age, "max_uses": max_uses, "unique": unique}
+        inv = await self._api_request("POST", f"/channels/{channel_id}/invites", json_data=payload)
+        code = inv.get("code")
+        return {
+            "code": code,
+            "url": f"https://discord.gg/{code}",
+            "channel_id": channel_id,
+            "max_age": inv.get("max_age"),
+            "max_uses": inv.get("max_uses"),
+            "info": f"Invite link created: https://discord.gg/{code}",
+        }
+
+    @tool(
+        "discord.invites.list",
+        description="List active invite links for a server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"}
+        },
+    )
+    async def invites_list(self, guild_id: str, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        invites = await self._api_request("GET", f"/guilds/{guild_id}/invites")
+        return [
+            {
+                "code": i.get("code"),
+                "url": f"https://discord.gg/{i.get('code')}",
+                "channel_id": i.get("channel", {}).get("id"),
+                "channel_name": i.get("channel", {}).get("name"),
+                "inviter": i.get("inviter", {}).get("username"),
+                "uses": i.get("uses"),
+                "max_uses": i.get("max_uses"),
+            }
+            for i in invites
+        ]
+
+    @tool(
+        "discord.threads.create",
+        description="Create a public thread channel under a text channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Parent text channel ID"},
+            "name": {"type": "string", "description": "Thread name"},
+            "auto_archive_duration": {"type": "integer", "description": "Auto archive duration in minutes (60, 1440, 4320, 10080)", "default": 1440}
+        },
+    )
+    async def threads_create(
+        self, channel_id: str, name: str, auto_archive_duration: int = 1440, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        payload = {"name": name, "auto_archive_duration": auto_archive_duration, "type": 11}
+        th = await self._api_request("POST", f"/channels/{channel_id}/threads", json_data=payload)
+        return {
+            "id": th.get("id"),
+            "name": th.get("name"),
+            "parent_id": th.get("parent_id"),
+            "guild_id": th.get("guild_id"),
+            "info": f"Thread '{name}' created successfully (ID: {th.get('id')}).",
+        }
+
+    @tool(
+        "discord.threads.list",
+        description="List active public threads on a server (guild)",
+        arguments={
+            "guild_id": {"type": "string", "description": "Server (guild) ID"}
+        },
+    )
+    async def threads_list(self, guild_id: str, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        res = await self._api_request("GET", f"/guilds/{guild_id}/threads/active")
+        threads = res.get("threads", [])
+        return [
+            {
+                "id": t.get("id"),
+                "name": t.get("name"),
+                "parent_id": t.get("parent_id"),
+                "message_count": t.get("message_count"),
+                "member_count": t.get("member_count"),
+            }
+            for t in threads
+        ]
