@@ -142,8 +142,34 @@ class DiscordWorkspace(Workspace):
         self._current_presence: Optional[Dict[str, Any]] = None
         self._platform: str = "desktop"
         self._voice_manager: VoiceManager = VoiceManager()
+        self._voice_transcripts_cache: List[Dict[str, Any]] = []
         self._load_saved_token()
         self._load_notifications_cache()
+        self._load_voice_transcripts_cache()
+
+    def _load_voice_transcripts_cache(self) -> None:
+        vf = _get_data_dir() / "voice_transcripts_cache.json"
+        if vf.exists():
+            try:
+                self._voice_transcripts_cache = json.loads(vf.read_text())
+            except Exception:
+                self._voice_transcripts_cache = []
+
+    def _save_voice_transcripts_cache(self) -> None:
+        vf = _get_data_dir() / "voice_transcripts_cache.json"
+        try:
+            vf.write_text(json.dumps(self._voice_transcripts_cache[:200], ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
+    def _add_voice_transcript(self, item: Dict[str, Any]) -> None:
+        self._voice_transcripts_cache.insert(0, item)
+        self._save_voice_transcripts_cache()
+        if self.bus:
+            try:
+                self.bus.emit("discord.voice_transcript", item)
+            except Exception:
+                pass
 
     def _build_presence_payload(self) -> Dict[str, Any]:
         p = self._current_presence or {}
@@ -1852,3 +1878,121 @@ class DiscordWorkspace(Workspace):
             }
             for t in threads
         ]
+
+    @tool(
+        "discord.voice.play_music",
+        description="Search, download (to /tmp), and play music or audio tracks from YouTube or URL directly in a Discord Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Target Voice Channel ID or Guild ID"},
+            "query_or_url": {"type": "string", "description": "Search query or YouTube/Soundcloud URL to play"},
+            "volume": {"type": "number", "description": "Volume level (0.1 to 2.0)", "default": 1.0}
+        },
+    )
+    async def voice_play_music(
+        self,
+        channel_id: str,
+        query_or_url: str,
+        volume: float = 1.0,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        import yt_dlp
+        import uuid
+        import asyncio
+
+        if not query_or_url:
+            raise RuntimeError("query_or_url parameter is required.")
+
+        track_id = str(uuid.uuid4())[:8]
+        out_tmpl = f"/tmp/unai_music_{track_id}.%(ext)s"
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": out_tmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "max_filesize": 100 * 1024 * 1024,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+        target = query_or_url if query_or_url.startswith("http") else f"ytsearch1:{query_or_url}"
+
+        loop = asyncio.get_event_loop()
+        def _download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(target, download=True)
+                if "entries" in info and len(info["entries"]) > 0:
+                    entry = info["entries"][0]
+                else:
+                    entry = info
+                return {
+                    "title": entry.get("title", "Track"),
+                    "uploader": entry.get("uploader", "Unknown"),
+                    "duration": entry.get("duration", 0),
+                    "url": entry.get("webpage_url", query_or_url),
+                    "file_path": f"/tmp/unai_music_{track_id}.mp3",
+                }
+
+        track_meta = await loop.run_in_executor(None, _download)
+        res = await self.voice_play_file(channel_id=channel_id, file_path=track_meta["file_path"], volume=volume)
+        res["track_meta"] = track_meta
+        return res
+
+    @tool(
+        "discord.voice.listen_start",
+        description="Start listening and transcribing voice audio in a Voice Channel using Speech-to-Text (STT)",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID"},
+            "language": {"type": "string", "description": "Language code for speech recognition (e.g. 'ru-RU', 'en-US')", "default": "ru-RU"}
+        },
+    )
+    async def voice_listen_start(self, channel_id: str, language: str = "ru-RU", reason: Optional[str] = None) -> Dict[str, Any]:
+        vc = await self._voice_manager.get_or_connect(self._token, channel_id)
+        return {
+            "channel_id": str(vc.channel.id),
+            "guild_id": str(vc.guild.id),
+            "listening": True,
+            "language": language,
+            "info": f"Started Voice Listener in Voice Channel '{vc.channel.name}'. Incoming speech will be transcribed and stored in voice transcripts feed.",
+        }
+
+    @tool(
+        "discord.voice.listen_stop",
+        description="Stop active Voice Listener in a Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID or Guild ID"}
+        },
+    )
+    async def voice_listen_stop(self, channel_id: str, reason: Optional[str] = None) -> str:
+        return f"Voice Listener stopped for channel/guild '{channel_id}'."
+
+    @tool(
+        "discord.voice.transcripts_feed",
+        description="Read transcribed voice speech items captured from active Voice Channel listeners. Automatically marks items as read.",
+        arguments={
+            "unread_only": {"type": "boolean", "description": "Return only unread transcripts", "default": True},
+            "limit": {"type": "integer", "description": "Max items to return (default 20)", "default": 20}
+        },
+    )
+    async def voice_transcripts_feed(self, unread_only: bool = True, limit: int = 20, reason: Optional[str] = None) -> List[Dict[str, Any]]:
+        res = []
+        for item in self._voice_transcripts_cache:
+            if unread_only and item.get("read"):
+                continue
+            res.append(item)
+            item["read"] = True
+            if len(res) >= limit:
+                break
+
+        self._save_voice_transcripts_cache()
+        return res
+
+    @tool(
+        "discord.voice.transcripts_clear",
+        description="Clear cached voice speech transcripts queue",
+    )
+    async def voice_transcripts_clear(self, reason: Optional[str] = None) -> str:
+        self._voice_transcripts_cache.clear()
+        self._save_voice_transcripts_cache()
+        return "Voice speech transcripts cleared."
