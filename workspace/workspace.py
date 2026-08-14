@@ -2259,11 +2259,7 @@ class DiscordWorkspace(Workspace):
             "quiet": True,
             "no_warnings": True,
             "max_filesize": 100 * 1024 * 1024,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "web", "mweb"]
-                }
-            },
+            "remote_components": ["ejs:github"],
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
