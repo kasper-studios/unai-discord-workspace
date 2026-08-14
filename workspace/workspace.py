@@ -76,10 +76,37 @@ except Exception:
         pass
 
 
+def _pcm_stereo_48k_to_mono_wav(raw_pcm: bytes, target_rate: int = 16000) -> io.BytesIO:
+    """Convert raw 48000Hz 16-bit 2-channel PCM from Discord to 16000Hz mono WAV."""
+    try:
+        try:
+            import audioop
+        except ImportError:
+            import audioop_lts as audioop
+        mono_48k = audioop.tomono(raw_pcm, 2, 0.5, 0.5)
+        mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, target_rate, None)
+        converted_pcm = mono_16k
+    except Exception:
+        # Fallback: step every 12 bytes (3 frames of stereo 16-bit) and take 1 channel
+        converted_pcm = bytearray()
+        for i in range(0, len(raw_pcm) - 3, 12):
+            converted_pcm.extend(raw_pcm[i:i+2])
+        target_rate = 16000
+
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(target_rate)
+        wf.writeframes(bytes(converted_pcm))
+    wav_io.seek(0)
+    return wav_io
+
+
 class STTVoiceSink(AudioSinkBase):
     """Real-time Voice Receiver and Speech-to-Text Sink for Discord channels."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 1.0):
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.8):
         super().__init__()
         self.callback = callback
         self.language = language
@@ -88,9 +115,15 @@ class STTVoiceSink(AudioSinkBase):
         self.user_last_spoke: Dict[int, float] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
         self.recognizer = sr.Recognizer()
-        self.recognizer.energy_threshold = 300
+        self.recognizer.energy_threshold = 150
+        self.recognizer.dynamic_energy_threshold = True
         self._running = True
-        self._check_task = asyncio.create_task(self._silence_checker())
+        self._check_task: Optional[Any] = None
+        try:
+            loop = asyncio.get_running_loop()
+            self._check_task = loop.create_task(self._silence_checker())
+        except RuntimeError:
+            pass
 
     def wants_opus(self) -> bool:
         return False
@@ -98,6 +131,14 @@ class STTVoiceSink(AudioSinkBase):
     def write(self, user: Optional[Any], data: Any) -> None:
         if not self._running or not getattr(data, "pcm", None):
             return
+
+        if self._check_task is None or self._check_task.done():
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    self._check_task = loop.create_task(self._silence_checker())
+            except Exception:
+                pass
 
         uid = getattr(user, "id", None) or (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0) or 0)
         uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
@@ -116,15 +157,15 @@ class STTVoiceSink(AudioSinkBase):
 
     async def _silence_checker(self) -> None:
         while self._running:
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
             now = time.time()
             to_flush = []
             for uid, last_time in list(self.user_last_spoke.items()):
                 buf_len = len(self.user_buffers.get(uid, b""))
                 # 48000 Hz * 2 channels * 2 bytes = 192,000 bytes per second
-                if now - last_time >= self.silence_threshold and buf_len > 192000 * 0.4:
+                if now - last_time >= self.silence_threshold and buf_len > 192000 * 0.25:
                     to_flush.append(uid)
-                elif now - last_time >= self.silence_threshold and buf_len <= 192000 * 0.4:
+                elif now - last_time >= self.silence_threshold and buf_len <= 192000 * 0.25:
                     self.user_buffers.pop(uid, None)
                     self.user_last_spoke.pop(uid, None)
 
@@ -140,14 +181,7 @@ class STTVoiceSink(AudioSinkBase):
 
         def _transcribe():
             try:
-                wav_io = io.BytesIO()
-                with wave.open(wav_io, "wb") as wf:
-                    wf.setnchannels(2)
-                    wf.setsampwidth(2)
-                    wf.setframerate(48000)
-                    wf.writeframes(raw_pcm)
-                wav_io.seek(0)
-
+                wav_io = _pcm_stereo_48k_to_mono_wav(raw_pcm, target_rate=16000)
                 with sr.AudioFile(wav_io) as source:
                     audio_data = self.recognizer.record(source)
 
