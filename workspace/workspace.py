@@ -69,6 +69,24 @@ def _get_token_file() -> Path:
 
 
 try:
+    import discord.opus
+    from ctypes.util import find_library
+    if not discord.opus.is_loaded():
+        lib = find_library("opus")
+        if lib:
+            discord.opus.load_opus(lib)
+    if hasattr(discord.opus, "Decoder"):
+        _orig_opus_decode = discord.opus.Decoder.decode
+        def _safe_opus_decode(self, data, *, fec=False):
+            if not data:
+                data = None
+                fec = False
+            return _orig_opus_decode(self, data, fec=fec)
+        discord.opus.Decoder.decode = _safe_opus_decode
+except Exception:
+    pass
+
+try:
     from discord.ext import voice_recv
     from discord.ext.voice_recv import reader as _vr_reader
     _vr_reader.UDPKeepAlive.delay = 5
@@ -102,7 +120,6 @@ class STTVoiceSink(AudioSinkBase):
         self.user_buffers: Dict[int, bytearray] = {}
         self.user_last_spoke: Dict[int, float] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
-        self._decoders: Dict[int, Any] = {}
         self.packets_received: int = 0
         self.bytes_received: int = 0
         self.transcripts_count: int = 0
@@ -120,7 +137,7 @@ class STTVoiceSink(AudioSinkBase):
             pass
 
     def wants_opus(self) -> bool:
-        return True
+        return False
 
     def write(self, user: Optional[Any], data: Any) -> None:
         if not self._running:
@@ -129,31 +146,8 @@ class STTVoiceSink(AudioSinkBase):
         uid = getattr(user, "id", None) or (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0) or 0)
         uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
 
-        # Decode Opus or retrieve PCM with robust error isolation
+        # Receive decoded PCM directly from jitter buffer
         pcm_bytes = getattr(data, "pcm", None)
-        if not pcm_bytes and getattr(data, "opus", None):
-            import discord.opus
-            from ctypes.util import find_library
-            if not discord.opus.is_loaded():
-                lib = find_library("opus")
-                if lib:
-                    discord.opus.load_opus(lib)
-
-            if uid not in self._decoders:
-                try:
-                    self._decoders[uid] = discord.opus.Decoder()
-                except Exception:
-                    return
-
-            try:
-                pcm_bytes = self._decoders[uid].decode(data.opus, fec=False)
-            except Exception:
-                try:
-                    self._decoders[uid] = discord.opus.Decoder()
-                except Exception:
-                    pass
-                return
-
         if not pcm_bytes:
             return
 
