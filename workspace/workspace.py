@@ -143,9 +143,34 @@ class DiscordWorkspace(Workspace):
         self._platform: str = "desktop"
         self._voice_manager: VoiceManager = VoiceManager()
         self._voice_transcripts_cache: List[Dict[str, Any]] = []
+        self._hermes_webhook_url: Optional[str] = None
         self._load_saved_token()
         self._load_notifications_cache()
         self._load_voice_transcripts_cache()
+
+    def _trigger_hermes_webhook(self, notif: Dict[str, Any]) -> None:
+        if not self._hermes_webhook_url:
+            return
+
+        async def _send():
+            try:
+                async with aiohttp.ClientSession() as session:
+                    author_obj = notif.get("author") or {}
+                    author_name = author_obj.get("username") if isinstance(author_obj, dict) else str(author_obj)
+                    payload = {
+                        "author": author_name,
+                        "from": author_name,
+                        "channel_id": notif.get("channel_id"),
+                        "guild_id": notif.get("guild_id"),
+                        "content": notif.get("content") or notif.get("text"),
+                        "text": notif.get("content") or notif.get("text"),
+                        "payload": notif,
+                    }
+                    await session.post(self._hermes_webhook_url, json=payload, timeout=5)
+            except Exception:
+                pass
+
+        asyncio.create_task(_send())
 
     def _load_voice_transcripts_cache(self) -> None:
         vf = _get_data_dir() / "voice_transcripts_cache.json"
@@ -165,6 +190,7 @@ class DiscordWorkspace(Workspace):
     def _add_voice_transcript(self, item: Dict[str, Any]) -> None:
         self._voice_transcripts_cache.insert(0, item)
         self._save_voice_transcripts_cache()
+        self._trigger_hermes_webhook(item)
         if self.bus:
             try:
                 self.bus.emit("discord.voice_transcript", item)
@@ -231,6 +257,7 @@ class DiscordWorkspace(Workspace):
     def _add_notification(self, notif: Dict[str, Any]) -> None:
         self._notifications_cache.insert(0, notif)
         self._save_notifications_cache()
+        self._trigger_hermes_webhook(notif)
         if self.bus:
             try:
                 self.bus.emit("discord.notification", notif)
@@ -1996,3 +2023,61 @@ class DiscordWorkspace(Workspace):
         self._voice_transcripts_cache.clear()
         self._save_voice_transcripts_cache()
         return "Voice speech transcripts cleared."
+
+    # ====================================================================
+    # Hermes Webhook Auto-Trigger Tools
+    # ====================================================================
+
+    @tool(
+        "discord.webhook.subscribe_hermes",
+        description="Subscribe Hermes CLI to incoming Discord messages and automatically wake up Hermes via Hermes Webhook API",
+        arguments={
+            "route_name": {"type": "string", "description": "Hermes webhook route name (e.g. 'discord-inbound')", "default": "discord-inbound"},
+            "prompt": {"type": "string", "description": "Prompt template with {payload...} fields", "default": "Новое сообщение в Discord от {payload.author}: {payload.content}"},
+            "deliver": {"type": "string", "description": "Delivery target: 'origin', 'log', 'telegram', 'discord'", "default": "origin"},
+            "hermes_port": {"type": "integer", "description": "Port of Hermes webhook daemon (default 8644)", "default": 8644},
+            "auto_trigger": {"type": "boolean", "description": "Enable auto HTTP POSTing payloads to Hermes webhook when new messages arrive", "default": True}
+        },
+    )
+    async def webhook_subscribe_hermes(
+        self,
+        route_name: str = "discord-inbound",
+        prompt: str = "Новое сообщение в Discord от {payload.author}: {payload.content}",
+        deliver: str = "origin",
+        hermes_port: int = 8644,
+        auto_trigger: bool = True,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        import shutil
+        import subprocess
+        hermes_bin = shutil.which("hermes") or "/home/kasperenok/.local/bin/hermes"
+        cmd = [
+            hermes_bin,
+            "webhook",
+            "subscribe",
+            route_name,
+            "--prompt",
+            prompt,
+            "--deliver",
+            deliver,
+        ]
+
+        sub_output = ""
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            sub_output = res.stdout or res.stderr
+        except Exception as e:
+            sub_output = f"Hermes CLI call error: {e}"
+
+        target_url = f"http://127.0.0.1:{hermes_port}/webhooks/{route_name}"
+        if auto_trigger:
+            self._hermes_webhook_url = target_url
+
+        return {
+            "route_name": route_name,
+            "webhook_url": target_url,
+            "auto_trigger_enabled": auto_trigger,
+            "cli_command": " ".join(cmd),
+            "cli_output": sub_output.strip(),
+            "info": f"Subscribed Hermes webhook route '{route_name}'. Auto-trigger URL: {target_url}",
+        }
