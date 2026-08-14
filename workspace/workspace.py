@@ -150,7 +150,7 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
 
 class KasperyaEnergyVad:
     """Frame-by-frame energy VAD with Discord DTX silence-gap flushing."""
-    SPEECH_THRESHOLD = 0.009
+    SPEECH_THRESHOLD = 0.012  # RMS ~400 on 48kHz mono
     MIN_SPEECH_CHUNKS = 3
 
     def __init__(self):
@@ -159,7 +159,6 @@ class KasperyaEnergyVad:
         self.last_packet_time = 0.0
         self.pre_roll = []
         self.buffer = bytearray()
-        self._rate_state = None
 
     def process_discord_frame(self, pcm_48k_stereo: bytes) -> None:
         try:
@@ -170,12 +169,10 @@ class KasperyaEnergyVad:
         now = time.time()
         self.last_packet_time = now
 
-        # 1. Convert 48k stereo -> 48k mono
-        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 1, 1)
-        # 2. Resample 48k mono -> 16k mono
-        mono_16k, self._rate_state = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, self._rate_state)
+        # 1. Convert 48k stereo -> 48k mono with 0.5/0.5 weights to prevent 2x clipping
+        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 0.5, 0.5)
 
-        rms = audioop.rms(mono_16k, 2)
+        rms = audioop.rms(mono_48k, 2)
         energy = rms / 32768.0
 
         if energy > self.SPEECH_THRESHOLD:
@@ -189,9 +186,9 @@ class KasperyaEnergyVad:
             self.speech_frames = 0
 
         if self.is_speaking:
-            self.buffer.extend(mono_16k)
+            self.buffer.extend(mono_48k)
         else:
-            self.pre_roll.append(mono_16k)
+            self.pre_roll.append(mono_48k)
             if len(self.pre_roll) > 5:
                 self.pre_roll.pop(0)
 
@@ -204,14 +201,23 @@ class KasperyaEnergyVad:
             except ImportError:
                 import audioop_lts as audioop
 
-            # Validate speech buffer has enough samples and real speech energy
-            # Minimum 400ms of speech (16000 * 2 * 0.4 = 12800 bytes)
-            if len(self.buffer) >= 12800:
+            # Validate speech buffer: minimum 400ms at 48kHz mono (48000 * 2 * 0.4 = 38400 bytes)
+            if len(self.buffer) >= 38400:
                 buf_rms = audioop.rms(self.buffer, 2)
                 if buf_rms >= 300:
-                    res = bytes(self.buffer)
+                    raw_48k = bytes(self.buffer)
                     self.buffer.clear()
-                    return res
+                    try:
+                        proc = subprocess.Popen(
+                            ['ffmpeg', '-y', '-f', 's16le', '-ar', '48000', '-ac', '1', '-i', 'pipe:0',
+                             '-af', 'highpass=f=60,lowpass=f=7800', '-ar', '16000', '-f', 'wav', 'pipe:1'],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                        )
+                        wav_out, _ = proc.communicate(raw_48k)
+                        if wav_out and len(wav_out) > 44:
+                            return wav_out
+                    except Exception:
+                        pass
             self.buffer.clear()
         return b''
 
@@ -299,17 +305,9 @@ class STTVoiceSink(AudioSinkBase):
             await asyncio.sleep(0.1)
             now = time.time()
             for uid, vad in list(self.user_vads.items()):
-                phrase_pcm = vad.check_flush(now, timeout=self.silence_threshold)
-                if phrase_pcm:
+                wav_bytes = vad.check_flush(now, timeout=self.silence_threshold)
+                if wav_bytes:
                     uinfo = self.user_info.get(uid, {"id": str(uid), "username": "Speaker"})
-                    wav_io = io.BytesIO()
-                    with wave.open(wav_io, "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(16000)
-                        wf.writeframes(phrase_pcm)
-                    wav_bytes = wav_io.getvalue()
-
                     try:
                         with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
                             wf_out.write(wav_bytes)
