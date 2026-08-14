@@ -220,12 +220,12 @@ class KasperyaEnergyVad:
 
         return self.check_flush(now)
 
-    def check_flush(self, now: float, timeout: float = 0.6) -> Optional[bytes]:
+    def check_flush(self, now: float, timeout: float = 0.5) -> Optional[bytes]:
         if not self.is_speaking:
             return None
 
-        # End phrase if: 18 silence packets (360ms) arrived OR timeout passed since last speech frame
-        phrase_ended = (self.silence_frames >= 18) or (now - self.last_speech_time >= timeout)
+        # End phrase if: 12 silence packets (240ms) arrived OR timeout passed since last speech frame
+        phrase_ended = (self.silence_frames >= 12) or (now - self.last_speech_time >= timeout)
         if not phrase_ended:
             return None
 
@@ -237,32 +237,32 @@ class KasperyaEnergyVad:
         except ImportError:
             import audioop_lts as audioop
 
-        # Validate speech buffer: minimum 300ms at 48kHz mono (48000 * 2 * 0.3 = 28800 bytes)
-        if len(self.buffer) >= 28800:
+        # Validate speech buffer: minimum 250ms at 48kHz mono (48000 * 2 * 0.25 = 24000 bytes)
+        if len(self.buffer) >= 24000:
             buf_rms = audioop.rms(self.buffer, 2)
             buf_peak = audioop.max(self.buffer, 2)
             buf_dur = len(self.buffer) / (48000 * 2)
 
-            if buf_rms >= 100:
+            if buf_rms >= 80:
                 raw_48k = bytes(self.buffer)
                 self.buffer.clear()
+
+                # Pure in-memory 48kHz mono WAV (Whisper natively supports 48kHz)
+                wav_io = io.BytesIO()
+                with wave.open(wav_io, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(48000)
+                    wf.writeframes(raw_48k)
+                wav_bytes = wav_io.getvalue()
+
                 try:
-                    proc = subprocess.Popen(
-                        ['ffmpeg', '-y', '-f', 's16le', '-ar', '48000', '-ac', '1', '-i', 'pipe:0',
-                         '-af', 'highpass=f=60,lowpass=f=7800', '-ar', '16000', '-f', 'wav', 'pipe:1'],
-                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-                    )
-                    wav_out, _ = proc.communicate(raw_48k)
-                    if wav_out and len(wav_out) > 44:
-                        try:
-                            dbg_log = _get_data_dir() / "voice_debug.log"
-                            with open(dbg_log, "a") as f:
-                                f.write(f"[{datetime.now()}] ⏹️ [VAD END] {self.username} phrase finished | Dur: {buf_dur:.2f}s | Avg RMS: {buf_rms} | Max Peak: {buf_peak}\n")
-                        except Exception:
-                            pass
-                        return wav_out
+                    dbg_log = _get_data_dir() / "voice_debug.log"
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] ⏹️ [VAD END] {self.username} phrase finished | Dur: {buf_dur:.2f}s | Avg RMS: {buf_rms} | Max Peak: {buf_peak}\n")
                 except Exception:
                     pass
+                return wav_bytes
         self.buffer.clear()
         return None
 
@@ -270,7 +270,7 @@ class KasperyaEnergyVad:
 class STTVoiceSink(AudioSinkBase):
     """Real-time Voice Receiver and Speech-to-Text Sink using Kasperya Energy VAD."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.6, stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.5, stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
         super().__init__()
         self.callback = callback
         self.language = language
@@ -353,18 +353,26 @@ class STTVoiceSink(AudioSinkBase):
 
     async def _silence_checker(self) -> None:
         while self._running:
-            await asyncio.sleep(0.1)
-            now = time.time()
-            for uid, vad in list(self.user_vads.items()):
-                wav_bytes = vad.check_flush(now, timeout=self.silence_threshold)
-                if wav_bytes:
-                    uinfo = self.user_info.get(uid, {"id": str(uid), "username": "Speaker"})
-                    try:
-                        with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
-                            wf_out.write(wav_bytes)
-                    except Exception:
-                        pass
-                    asyncio.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
+            try:
+                await asyncio.sleep(0.08)
+                now = time.time()
+                for uid, vad in list(self.user_vads.items()):
+                    wav_bytes = vad.check_flush(now, timeout=self.silence_threshold)
+                    if wav_bytes:
+                        uinfo = self.user_info.get(uid, {"id": str(uid), "username": vad.username or "Speaker"})
+                        try:
+                            with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
+                                wf_out.write(wav_bytes)
+                        except Exception:
+                            pass
+                        asyncio.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
+            except Exception as e:
+                try:
+                    dbg_log = _get_data_dir() / "voice_debug.log"
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] ❌ Silence checker exception: {e}\n")
+                except Exception:
+                    pass
 
     def _is_whisper_hallucination(self, text: str) -> bool:
         """Filter out common Whisper hallucinations generated on silence or low noise."""
@@ -394,13 +402,18 @@ class STTVoiceSink(AudioSinkBase):
 
     async def _process_stt_wav(self, uid: int, uinfo: Dict[str, Any], wav_bytes: bytes) -> None:
         dbg_log = _get_data_dir() / "voice_debug.log"
-        text = ""
+        username = uinfo.get("username") or "Speaker"
+        try:
+            with open(dbg_log, "a") as f:
+                f.write(f"[{datetime.now()}] 🚀 [STT SEND] Transcribing {len(wav_bytes)} bytes audio for {username}...\n")
+        except Exception:
+            pass
 
+        text = ""
         cfg = self.stt_config or {}
         provider = cfg.get("provider", "omniroute")
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
-        # Always use the full whisper-large-v3 model (matches Kasperya)
         model = "groq/whisper-large-v3"
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
 
@@ -420,18 +433,18 @@ class STTVoiceSink(AudioSinkBase):
                             candidate = data.get("text", "").strip()
                             if self._is_whisper_hallucination(candidate):
                                 with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] Whisper hallucination ignored: '{candidate}'\n")
+                                    f.write(f"[{datetime.now()}] ⚠️ Whisper hallucination ignored for {username}: '{candidate}'\n")
                             else:
                                 text = candidate
                                 with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] Whisper ({model}) recognized for {uinfo.get('username')}: '{text}'\n")
+                                    f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Whisper ({model}) for {username}: '{text}'\n")
                         else:
                             err_body = await resp.text()
                             with open(dbg_log, "a") as f:
-                                f.write(f"[{datetime.now()}] Whisper API status {resp.status}: {err_body[:200]}\n")
+                                f.write(f"[{datetime.now()}] ❌ Whisper API status {resp.status}: {err_body[:200]}\n")
             except Exception as e:
                 with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] Whisper API error: {e}, falling back to Google\n")
+                    f.write(f"[{datetime.now()}] ❌ Whisper API error: {e}, falling back to Google\n")
 
         # Fallback to Google Web Speech API
         if not text:
