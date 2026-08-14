@@ -148,133 +148,61 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
     return wav_io.getvalue()
 
 
-class KasperyaEnergyVad:
-    """Frame-by-frame energy VAD with Discord DTX silence-gap flushing."""
-    SPEECH_THRESHOLD = 0.0035  # RMS ~115 on unclipped 48kHz mono
-    MIN_SPEECH_CHUNKS = 2
+class DiscordSRAudioSource(sr.AudioSource):
+    """AudioSource stream adaptor that reads incoming Discord PCM buffers for SpeechRecognition."""
+    little_endian = True
+    SAMPLE_RATE = 48000
+    SAMPLE_WIDTH = 2
+    CHANNELS = 2
+    CHUNK = 960
 
-    def __init__(self, username: str = "Speaker"):
-        self.username = username
-        self.is_speaking = False
-        self.speech_frames = 0
-        self.silence_frames = 0
-        self.total_frames = 0
-        self.last_speech_time = 0.0
-        self.last_packet_time = 0.0
-        self.pre_roll = []
-        self.buffer = bytearray()
+    def __init__(self, buffer: array.array):
+        self.buffer = buffer
+        self._entered = False
 
-    def process_discord_frame(self, pcm_48k_stereo: bytes) -> Optional[bytes]:
+    @property
+    def stream(self):
+        return self
+
+    def __enter__(self):
+        self._entered = True
+        return self
+
+    def __exit__(self, *exc):
+        self._entered = False
+
+    def read(self, size: int) -> bytes:
         try:
             import audioop
         except ImportError:
             import audioop_lts as audioop
 
-        now = time.time()
-        self.last_packet_time = now
-        self.total_frames += 1
-
-        # 1. Extract clean Left channel (1.0, 0.0) to avoid any phase cancellation between stereo mic channels
-        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 1.0, 0.0)
-
-        rms = audioop.rms(mono_48k, 2)
-        peak = audioop.max(mono_48k, 2)
-        energy = rms / 32768.0
-
-        if energy > self.SPEECH_THRESHOLD:
-            self.speech_frames += 1
-            self.silence_frames = 0
-            self.last_speech_time = now
-            if not self.is_speaking and self.speech_frames >= self.MIN_SPEECH_CHUNKS:
-                self.is_speaking = True
-                self.buffer = bytearray()
-                for pre in self.pre_roll:
-                    self.buffer.extend(pre)
-                try:
-                    dbg_log = _get_data_dir() / "voice_debug.log"
-                    with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] 🎙️ [VAD START] {self.username} started speaking | RMS: {rms} | Peak: {peak} | Energy: {energy:.4f}\n")
-                except Exception:
-                    pass
+        for _ in range(12):
+            if len(self.buffer) < size * self.CHANNELS:
+                time.sleep(0.04)
+            else:
+                break
         else:
-            self.speech_frames = 0
-            if self.is_speaking:
-                self.silence_frames += 1
+            if len(self.buffer) == 0:
+                return b''
 
-        if self.is_speaking:
-            self.buffer.extend(mono_48k)
-        else:
-            self.pre_roll.append(mono_48k)
-            if len(self.pre_roll) > 5:
-                self.pre_roll.pop(0)
+        chunksize = size * self.CHANNELS
+        audiochunk = self.buffer[:chunksize].tobytes()
+        del self.buffer[: min(chunksize, len(audiochunk))]
+        # Downmix 48k stereo to 48k mono
+        return audioop.tomono(audiochunk, 2, 0.5, 0.5)
 
-        # Log periodic audio characteristics every 25 frames (~0.5s)
-        if self.total_frames % 25 == 1:
-            try:
-                dbg_log = _get_data_dir() / "voice_debug.log"
-                status = f"SPEAKING (buf={len(self.buffer)/(48000*2):.1f}s, sil={self.silence_frames})" if self.is_speaking else "IDLE"
-                with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] 📊 [AUDIO {self.username}] RMS: {rms:<4} | Peak: {peak:<5} | Energy: {energy:.4f} | State: {status}\n")
-            except Exception:
-                pass
-
-        return self.check_flush(now)
-
-    def check_flush(self, now: float, timeout: float = 0.7) -> Optional[bytes]:
-        if not self.is_speaking:
-            return None
-
-        # End phrase if: 25 silence packets (500ms) arrived OR timeout (700ms) passed since last speech frame
-        phrase_ended = (self.silence_frames >= 25) or (now - self.last_speech_time >= timeout)
-        if not phrase_ended:
-            return None
-
-        self.is_speaking = False
-        self.speech_frames = 0
-        self.silence_frames = 0
-        try:
-            import audioop
-        except ImportError:
-            import audioop_lts as audioop
-
-        # Validate speech buffer: minimum 500ms at 48kHz mono (48000 * 2 * 0.5 = 48000 bytes)
-        if len(self.buffer) >= 48000:
-            buf_rms = audioop.rms(self.buffer, 2)
-            buf_peak = audioop.max(self.buffer, 2)
-            buf_dur = len(self.buffer) / (48000 * 2)
-
-            if buf_rms >= 80:
-                raw_48k = bytes(self.buffer)
-                self.buffer.clear()
-
-                # Pure in-memory 48kHz mono WAV
-                wav_io = io.BytesIO()
-                with wave.open(wav_io, 'wb') as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(48000)
-                    wf.writeframes(raw_48k)
-                wav_bytes = wav_io.getvalue()
-
-                try:
-                    dbg_log = _get_data_dir() / "voice_debug.log"
-                    with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] ⏹️ [VAD END] {self.username} phrase finished | Dur: {buf_dur:.2f}s | Avg RMS: {buf_rms} | Max Peak: {buf_peak}\n")
-                except Exception:
-                    pass
-                return wav_bytes
-        self.buffer.clear()
-        return None
+    def close(self):
+        del self.buffer[:]
 
 
 class STTVoiceSink(AudioSinkBase):
-    """Real-time Voice Receiver and Speech-to-Text Sink using Kasperya Energy VAD."""
+    """Real-time Voice Receiver and Speech-to-Text Sink using dynamic SpeechRecognition."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.7, stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
+    def __init__(self, callback: Any, language: str = "ru-RU", stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
         super().__init__()
         self.callback = callback
         self.language = language
-        self.silence_threshold = silence_threshold_seconds
         self.stt_config = stt_config or {}
         try:
             self.loop = loop or asyncio.get_running_loop()
@@ -284,7 +212,9 @@ class STTVoiceSink(AudioSinkBase):
             except RuntimeError:
                 self.loop = None
 
-        self.user_vads: Dict[int, KasperyaEnergyVad] = {}
+        self._stoppers: Dict[int, Any] = {}
+        self._buffers: Dict[int, array.array] = {}
+        self._recognizers: Dict[int, sr.Recognizer] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
         self.packets_received: int = 0
         self.bytes_received: int = 0
@@ -292,10 +222,6 @@ class STTVoiceSink(AudioSinkBase):
         self.last_packet_time: float = 0.0
         self.speakers: set = set()
         self._running = True
-        self._check_task: Optional[Any] = None
-
-        if self.loop and self.loop.is_running():
-            self._check_task = self.loop.create_task(self._silence_checker())
 
     def wants_opus(self) -> bool:
         return False
@@ -313,25 +239,11 @@ class STTVoiceSink(AudioSinkBase):
         uid = user_id or ssrc or 0
         uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
 
-        if (self._check_task is None or self._check_task.done()) and self.loop and self.loop.is_running():
-            try:
-                self._check_task = self.loop.create_task(self._silence_checker())
-            except Exception:
-                pass
-
         now = time.time()
         self.packets_received += 1
         self.bytes_received += len(pcm_bytes)
         self.last_packet_time = now
         self.speakers.add(uname)
-
-        if ssrc and user_id and ssrc != user_id and ssrc in self.user_vads:
-            old_vad = self.user_vads.pop(ssrc)
-            if user_id not in self.user_vads:
-                self.user_vads[user_id] = old_vad
-
-        if uid not in self.user_vads:
-            self.user_vads[uid] = KasperyaEnergyVad(username=uname)
 
         self.user_info[uid] = {
             "id": str(user_id or uid),
@@ -339,40 +251,42 @@ class STTVoiceSink(AudioSinkBase):
             "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
         }
 
-        self.user_vads[uid].username = uname
-        wav_bytes = self.user_vads[uid].process_discord_frame(pcm_bytes)
-        if wav_bytes:
-            uinfo = self.user_info.get(uid, {"id": str(uid), "username": uname})
-            try:
-                with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
-                    wf_out.write(wav_bytes)
-            except Exception:
-                pass
-            if self.loop and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._process_stt_wav(uid, uinfo, wav_bytes), self.loop)
+        if uid not in self._buffers:
+            buf = array.array('B')
+            self._buffers[uid] = buf
+            rec = sr.Recognizer()
+            rec.energy_threshold = 250
+            rec.pause_threshold = 0.8
+            rec.phrase_threshold = 0.3
+            rec.non_speaking_duration = 0.5
+            rec.dynamic_energy_threshold = True
+            self._recognizers[uid] = rec
 
-    async def _silence_checker(self) -> None:
-        while self._running:
-            try:
-                await asyncio.sleep(0.08)
-                now = time.time()
-                for uid, vad in list(self.user_vads.items()):
-                    wav_bytes = vad.check_flush(now, timeout=self.silence_threshold)
-                    if wav_bytes:
-                        uinfo = self.user_info.get(uid, {"id": str(uid), "username": vad.username or "Speaker"})
-                        try:
-                            with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
-                                wf_out.write(wav_bytes)
-                        except Exception:
-                            pass
-                        asyncio.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
-            except Exception as e:
+            def _on_phrase_audio(_rec: sr.Recognizer, audio_data: sr.AudioData):
+                if not self._running:
+                    return
                 try:
+                    wav_16k = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
+                    uinfo = self.user_info.get(uid, {"id": str(uid), "username": uname})
+                    try:
+                        with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
+                            wf_out.write(wav_16k)
+                    except Exception:
+                        pass
+                    if self.loop and self.loop.is_running():
+                        asyncio.run_coroutine_threadsafe(self._process_stt_wav(uid, uinfo, wav_16k), self.loop)
+                except Exception as e:
                     dbg_log = _get_data_dir() / "voice_debug.log"
                     with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] ❌ Silence checker exception: {e}\n")
-                except Exception:
-                    pass
+                        f.write(f"[{datetime.now()}] ❌ SpeechRecognition phrase error: {e}\n")
+
+            src = DiscordSRAudioSource(buf)
+            self._stoppers[uid] = rec.listen_in_background(src, _on_phrase_audio, phrase_time_limit=15)
+            dbg_log = _get_data_dir() / "voice_debug.log"
+            with open(dbg_log, "a") as f:
+                f.write(f"[{datetime.now()}] 🎧 Background recognizer started for {uname}\n")
+
+        self._buffers[uid].extend(pcm_bytes)
 
     def _is_whisper_hallucination(self, text: str) -> bool:
         """Filter out common Whisper hallucinations generated on silence or low noise."""
@@ -504,7 +418,14 @@ class STTVoiceSink(AudioSinkBase):
 
     def cleanup(self) -> None:
         self._running = False
-        self.user_vads.clear()
+        for stopper in list(self._stoppers.values()):
+            try:
+                stopper(wait=False)
+            except Exception:
+                pass
+        self._stoppers.clear()
+        self._buffers.clear()
+        self._recognizers.clear()
 
 
 class VoiceManager:
