@@ -114,11 +114,12 @@ def _pcm_stereo_48k_to_mono_wav(raw_pcm: bytes, target_rate: int = 16000) -> io.
 class STTVoiceSink(AudioSinkBase):
     """Real-time Voice Receiver and Speech-to-Text Sink for Discord channels."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.8):
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.8, stt_config: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.callback = callback
         self.language = language
         self.silence_threshold = silence_threshold_seconds
+        self.stt_config = stt_config or {}
         self.user_buffers: Dict[int, bytearray] = {}
         self.user_last_spoke: Dict[int, float] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
@@ -232,39 +233,65 @@ class STTVoiceSink(AudioSinkBase):
                     asyncio.create_task(self._process_stt(uid, uinfo, raw_pcm))
 
     async def _process_stt(self, uid: int, uinfo: Dict[str, Any], raw_pcm: bytes) -> None:
-        loop = asyncio.get_event_loop()
+        dbg_log = _get_data_dir() / "voice_debug.log"
+        text = ""
 
-        def _transcribe():
-            dbg_log = _get_data_dir() / "voice_debug.log"
+        # 1. Convert to 16kHz mono WAV in-memory
+        wav_io = _pcm_stereo_48k_to_mono_wav(raw_pcm, target_rate=16000)
+        wav_bytes = wav_io.getvalue()
+        try:
+            with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
+                wf_out.write(wav_bytes)
+        except Exception:
+            pass
+
+        # 2. Try Whisper / OpenAI-compatible / OmniRoute endpoint first
+        cfg = self.stt_config or {}
+        provider = cfg.get("provider", "omniroute")
+        api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
+        api_key = cfg.get("api_key", "omniroute")
+        model = cfg.get("model", "groq/whisper-large-v3-turbo")
+        lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
+
+        if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
             try:
-                wav_io = _pcm_stereo_48k_to_mono_wav(raw_pcm, target_rate=16000)
-                try:
-                    with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
-                        wf_out.write(wav_io.getvalue())
-                except Exception:
-                    pass
-                with sr.AudioFile(wav_io) as source:
-                    audio_data = self.recognizer.record(source)
+                form = aiohttp.FormData()
+                form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+                form.add_field("model", model)
+                form.add_field("language", lang)
+                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-                try:
-                    recognized = self.recognizer.recognize_google(audio_data, language=self.language)
-                    with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] Recognized for {uinfo.get('username')}: '{recognized}' ({len(raw_pcm)} bytes)\n")
-                    return recognized
-                except sr.UnknownValueError:
-                    with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] SpeechRecognition UnknownValueError (unclear audio or noise, {len(raw_pcm)} bytes)\n")
-                    return ""
-                except Exception as e:
-                    with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] SpeechRecognition error: {e} ({len(raw_pcm)} bytes)\n")
-                    return ""
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=12) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            text = data.get("text", "").strip()
+                            with open(dbg_log, "a") as f:
+                                f.write(f"[{datetime.now()}] Whisper ({model}) recognized for {uinfo.get('username')}: '{text}' ({len(raw_pcm)} bytes)\n")
+                        else:
+                            err_body = await resp.text()
+                            with open(dbg_log, "a") as f:
+                                f.write(f"[{datetime.now()}] Whisper API status {resp.status}: {err_body[:200]}\n")
             except Exception as e:
                 with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] _transcribe conversion error: {e}\n")
-                return ""
+                    f.write(f"[{datetime.now()}] Whisper API error: {e}, falling back to Google\n")
 
-        text = await loop.run_in_executor(None, _transcribe)
+        # 3. Fallback to Google Web Speech API if Whisper did not return text
+        if not text:
+            def _google_transcribe():
+                try:
+                    with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
+                        audio_data = self.recognizer.record(source)
+                    return self.recognizer.recognize_google(audio_data, language=self.language)
+                except Exception:
+                    return ""
+
+            loop = asyncio.get_event_loop()
+            text = await loop.run_in_executor(None, _google_transcribe)
+            if text:
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] Google STT recognized for {uinfo.get('username')}: '{text}'\n")
+
         if text and text.strip():
             self.transcripts_count += 1
             notif = {
@@ -370,7 +397,7 @@ class VoiceManager:
         vc = await channel.connect(cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=15.0)
         return vc
 
-    async def start_listening(self, token: str, channel_id_str: str, on_transcript_cb: Any, language: str = "ru-RU") -> Dict[str, Any]:
+    async def start_listening(self, token: str, channel_id_str: str, on_transcript_cb: Any, language: str = "ru-RU", stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         vc = await self.get_or_connect(token, channel_id_str)
         gid = vc.guild.id
 
@@ -382,7 +409,7 @@ class VoiceManager:
             except Exception:
                 pass
 
-        sink = STTVoiceSink(callback=on_transcript_cb, language=language)
+        sink = STTVoiceSink(callback=on_transcript_cb, language=language, stt_config=stt_config)
         if hasattr(vc, "listen"):
             vc.listen(sink)
         self._active_sinks[gid] = sink
@@ -451,12 +478,14 @@ class DiscordWorkspace(Workspace):
         self._voice_manager: VoiceManager = VoiceManager()
         self._voice_transcripts_cache: List[Dict[str, Any]] = []
         self._music_config: Dict[str, Any] = {}
+        self._stt_config: Dict[str, Any] = {}
         self._active_tracks: Dict[int, Dict[str, Any]] = {}
         self._hermes_webhook_url: Optional[str] = None
         self._load_saved_token()
         self._load_notifications_cache()
         self._load_voice_transcripts_cache()
         self._load_music_config()
+        self._load_stt_config()
 
     def _load_music_config(self) -> None:
         mf = _get_data_dir() / "music_config.json"
@@ -472,6 +501,30 @@ class DiscordWorkspace(Workspace):
         mf = _get_data_dir() / "music_config.json"
         try:
             mf.write_text(json.dumps(self._music_config, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
+    def _load_stt_config(self) -> None:
+        sf = _get_data_dir() / "stt_config.json"
+        if sf.exists():
+            try:
+                self._stt_config = json.loads(sf.read_text())
+            except Exception:
+                self._stt_config = {}
+        else:
+            self._stt_config = {
+                "provider": "omniroute",
+                "api_base": "http://localhost:20128/v1",
+                "api_key": "omniroute",
+                "model": "groq/whisper-large-v3-turbo",
+                "language": "ru"
+            }
+            self._save_stt_config()
+
+    def _save_stt_config(self) -> None:
+        sf = _get_data_dir() / "stt_config.json"
+        try:
+            sf.write_text(json.dumps(self._stt_config, ensure_ascii=False, indent=2))
         except Exception:
             pass
 
@@ -2477,6 +2530,40 @@ class DiscordWorkspace(Workspace):
         return res
 
     @tool(
+        "discord.voice.stt_configure",
+        description="Configure Speech-to-Text (STT) Whisper API endpoint (OmniRoute, Groq, OpenAI, or local Whisper)",
+        arguments={
+            "provider": {"type": "string", "description": "STT Provider: 'omniroute', 'openai_compatible', 'groq', 'google'", "default": "omniroute"},
+            "api_base": {"type": "string", "description": "OpenAI-compatible Whisper API base URL (default: 'http://localhost:20128/v1')", "default": "http://localhost:20128/v1"},
+            "api_key": {"type": "string", "description": "API Key for Whisper service", "default": "omniroute"},
+            "model": {"type": "string", "description": "Whisper Model ID (e.g. 'groq/whisper-large-v3-turbo', 'groq/whisper-large-v3', 'whisper-1')", "default": "groq/whisper-large-v3-turbo"},
+            "language": {"type": "string", "description": "Default language code ('ru', 'en')", "default": "ru"}
+        },
+    )
+    async def voice_stt_configure(
+        self,
+        provider: str = "omniroute",
+        api_base: str = "http://localhost:20128/v1",
+        api_key: str = "omniroute",
+        model: str = "groq/whisper-large-v3-turbo",
+        language: str = "ru",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self._stt_config = {
+            "provider": provider.lower().strip(),
+            "api_base": api_base.strip(),
+            "api_key": api_key.strip(),
+            "model": model.strip(),
+            "language": language.strip(),
+        }
+        self._save_stt_config()
+        return {
+            "configured": True,
+            "stt_config": self._stt_config,
+            "info": f"STT configured successfully to use provider '{provider}' with model '{model}' at '{api_base}'.",
+        }
+
+    @tool(
         "discord.voice.listen_start",
         description="Start listening and transcribing voice audio in a Voice Channel using Speech-to-Text (STT)",
         arguments={
@@ -2490,6 +2577,7 @@ class DiscordWorkspace(Workspace):
             channel_id_str=channel_id,
             on_transcript_cb=self._add_voice_transcript,
             language=language,
+            stt_config=self._stt_config,
         )
 
     @tool(
