@@ -185,6 +185,14 @@ class STTVoiceSink(AudioSinkBase):
         self.last_packet_time = now
         self.speakers.add(uname)
 
+        if self.packets_received % 25 == 1:
+            try:
+                dbg_log = _get_data_dir() / "voice_debug.log"
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] STTVoiceSink received packet #{self.packets_received} from {uname} (pcm: {len(pcm_bytes)} bytes)\n")
+            except Exception:
+                pass
+
         if uid not in self.user_buffers:
             self.user_buffers[uid] = bytearray()
             self.user_info[uid] = {
@@ -221,18 +229,28 @@ class STTVoiceSink(AudioSinkBase):
         loop = asyncio.get_event_loop()
 
         def _transcribe():
+            dbg_log = _get_data_dir() / "voice_debug.log"
             try:
                 wav_io = _pcm_stereo_48k_to_mono_wav(raw_pcm, target_rate=16000)
                 with sr.AudioFile(wav_io) as source:
                     audio_data = self.recognizer.record(source)
 
                 try:
-                    return self.recognizer.recognize_google(audio_data, language=self.language)
+                    recognized = self.recognizer.recognize_google(audio_data, language=self.language)
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] Recognized for {uinfo.get('username')}: '{recognized}' ({len(raw_pcm)} bytes)\n")
+                    return recognized
                 except sr.UnknownValueError:
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] SpeechRecognition UnknownValueError (unclear audio or noise, {len(raw_pcm)} bytes)\n")
                     return ""
-                except Exception:
+                except Exception as e:
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] SpeechRecognition error: {e} ({len(raw_pcm)} bytes)\n")
                     return ""
-            except Exception:
+            except Exception as e:
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] _transcribe conversion error: {e}\n")
                 return ""
 
         text = await loop.run_in_executor(None, _transcribe)
