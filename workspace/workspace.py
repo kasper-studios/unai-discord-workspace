@@ -108,7 +108,7 @@ def _pcm_stereo_48k_to_mono_wav(raw_pcm: bytes, target_rate: int = 16000) -> io.
 class STTVoiceSink(AudioSinkBase):
     """Real-time Voice Receiver and Speech-to-Text Sink for Discord channels."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.8, stt_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 1.3, stt_config: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.callback = callback
         self.language = language
@@ -213,9 +213,10 @@ class STTVoiceSink(AudioSinkBase):
             for uid, last_time in list(self.user_last_spoke.items()):
                 buf_len = len(self.user_buffers.get(uid, b""))
                 # 48000 Hz * 2 channels * 2 bytes = 192,000 bytes per second
-                if now - last_time >= self.silence_threshold and buf_len > 192000 * 0.25:
+                # Flush when user paused for >= 1.3s or speech reached 12 seconds
+                if (now - last_time >= self.silence_threshold and buf_len >= 192000 * 0.4) or (buf_len >= 192000 * 12.0):
                     to_flush.append(uid)
-                elif now - last_time >= self.silence_threshold and buf_len <= 192000 * 0.25:
+                elif now - last_time >= self.silence_threshold and buf_len < 192000 * 0.4:
                     self.user_buffers.pop(uid, None)
                     self.user_last_spoke.pop(uid, None)
 
@@ -233,7 +234,7 @@ class STTVoiceSink(AudioSinkBase):
                         rms = audioop.rms(raw_pcm, 2)
                     except Exception:
                         rms = 1000
-                    if rms < 350:
+                    if rms < 200:
                         continue
                     asyncio.create_task(self._process_stt(uid, uinfo, raw_pcm))
 
