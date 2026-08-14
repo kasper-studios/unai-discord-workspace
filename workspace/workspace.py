@@ -288,7 +288,6 @@ class STTVoiceSink(AudioSinkBase):
                 form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                 form.add_field("model", model)
                 form.add_field("language", lang)
-                form.add_field("prompt", "Разговорная речь в голосовом чате Discord.")
                 form.add_field("temperature", "0.0")
                 headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
