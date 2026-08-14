@@ -70,6 +70,8 @@ def _get_token_file() -> Path:
 
 try:
     from discord.ext import voice_recv
+    from discord.ext.voice_recv import reader as _vr_reader
+    _vr_reader.UDPKeepAlive.delay = 5
     AudioSinkBase = voice_recv.AudioSink
 except Exception:
     class AudioSinkBase:
@@ -115,6 +117,11 @@ class STTVoiceSink(AudioSinkBase):
         self.user_last_spoke: Dict[int, float] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
         self._decoders: Dict[int, Any] = {}
+        self.packets_received: int = 0
+        self.bytes_received: int = 0
+        self.transcripts_count: int = 0
+        self.last_packet_time: float = 0.0
+        self.speakers: set = set()
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = 150
         self.recognizer.dynamic_energy_threshold = True
@@ -173,6 +180,11 @@ class STTVoiceSink(AudioSinkBase):
                 pass
 
         now = time.time()
+        self.packets_received += 1
+        self.bytes_received += len(pcm_bytes)
+        self.last_packet_time = now
+        self.speakers.add(uname)
+
         if uid not in self.user_buffers:
             self.user_buffers[uid] = bytearray()
             self.user_info[uid] = {
@@ -225,6 +237,7 @@ class STTVoiceSink(AudioSinkBase):
 
         text = await loop.run_in_executor(None, _transcribe)
         if text and text.strip():
+            self.transcripts_count += 1
             notif = {
                 "id": str(int(time.time() * 1000)),
                 "type": "voice_transcript",
@@ -237,6 +250,16 @@ class STTVoiceSink(AudioSinkBase):
             }
             if self.callback:
                 self.callback(notif)
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "packets_received": self.packets_received,
+            "bytes_received": self.bytes_received,
+            "transcripts_count": self.transcripts_count,
+            "speakers": list(self.speakers),
+            "last_packet_seconds_ago": round(time.time() - self.last_packet_time, 1) if self.last_packet_time else None,
+            "running": self._running,
+        }
 
     def cleanup(self) -> None:
         self._running = False
@@ -359,6 +382,24 @@ class VoiceManager:
                 self._active_sinks.pop(gid, None)
                 return f"Voice Listener stopped for guild {gid}."
         return "No active Voice Listener was found for this channel/guild."
+
+    async def get_status(self, token: str, channel_id_str: str) -> Dict[str, Any]:
+        client = await self.get_py_client(token)
+        cid = int(channel_id_str) if channel_id_str.isdigit() else 0
+        for gid, sink in list(self._active_sinks.items()):
+            g = client.get_guild(gid)
+            if cid == 0 or gid == cid or (g and g.get_channel(cid)):
+                stats = sink.get_stats()
+                return {
+                    "listening": True,
+                    "guild_id": str(gid),
+                    "guild_name": g.name if g else "Unknown",
+                    "channel_id": str(g.voice_client.channel.id) if g and g.voice_client and g.voice_client.channel else channel_id_str,
+                    "channel_name": g.voice_client.channel.name if g and g.voice_client and g.voice_client.channel else "Unknown",
+                    "stats": stats,
+                    "info": f"Listening is active. Received {stats.get('packets_received', 0)} packets ({stats.get('bytes_received', 0)} PCM bytes). Transcripts generated: {stats.get('transcripts_count', 0)}.",
+                }
+        return {"listening": False, "stats": None, "info": "No active voice listener is running on this channel/guild."}
 
     def is_listening(self, guild_id: int) -> bool:
         return guild_id in self._active_sinks
@@ -2431,6 +2472,19 @@ class DiscordWorkspace(Workspace):
     )
     async def voice_listen_stop(self, channel_id: str, reason: Optional[str] = None) -> str:
         return await self._voice_manager.stop_listening(
+            token=self._token,
+            channel_id_str=channel_id,
+        )
+
+    @tool(
+        "discord.voice.listen_status",
+        description="Get diagnostic statistics of active Voice Listener (packets received, PCM bytes, transcripts generated, active speakers)",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID or Guild ID"}
+        },
+    )
+    async def voice_listen_status(self, channel_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        return await self._voice_manager.get_status(
             token=self._token,
             channel_id_str=channel_id,
         )
