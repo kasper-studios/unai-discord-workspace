@@ -79,10 +79,15 @@ class VoiceManager:
                 discord.opus.load_opus(lib)
 
         if self._py_client is None or self._py_client.is_closed():
-            intents = discord.Intents.default()
-            intents.voice_states = True
-            intents.guilds = True
-            client = discord.Client(intents=intents)
+            if hasattr(discord, "Intents"):
+                intents = discord.Intents.default()
+                if hasattr(intents, "voice_states"):
+                    intents.voice_states = True
+                if hasattr(intents, "guilds"):
+                    intents.guilds = True
+                client = discord.Client(intents=intents)
+            else:
+                client = discord.Client()
 
             clean_token = token.replace("Bot ", "").strip()
             is_bot = token.startswith("Bot ")
@@ -93,7 +98,7 @@ class VoiceManager:
             async def on_ready():
                 ready_event.set()
 
-            asyncio.create_task(client.start(clean_token, bot=is_bot))
+            asyncio.create_task(client.start(clean_token))
             try:
                 await asyncio.wait_for(ready_event.wait(), timeout=8.0)
             except Exception:
