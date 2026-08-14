@@ -108,7 +108,7 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
-                "-af", "highpass=f=80,lowpass=f=8000,volume=1.5", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"
+                "-af", "adelay=200|200,apad=pad_dur=0.3,highpass=f=80,lowpass=f=8000,volume=1.5", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
