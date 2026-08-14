@@ -79,7 +79,7 @@ except Exception:
 
 
 def _pcm_stereo_48k_to_mono_wav(raw_pcm: bytes, target_rate: int = 16000) -> io.BytesIO:
-    """Convert raw 48000Hz 16-bit 2-channel PCM from Discord to 16000Hz mono WAV with RMS gain boosting."""
+    """Convert raw 48000Hz 16-bit 2-channel PCM from Discord to 16000Hz mono WAV."""
     try:
         try:
             import audioop
@@ -87,13 +87,7 @@ def _pcm_stereo_48k_to_mono_wav(raw_pcm: bytes, target_rate: int = 16000) -> io.
             import audioop_lts as audioop
         mono_48k = audioop.tomono(raw_pcm, 2, 0.5, 0.5)
         mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, target_rate, None)
-        # Gain boosting: calculate RMS and boost quiet audio up to optimal ~6000 target RMS
-        rms = audioop.rms(mono_16k, 2)
-        if 50 < rms < 4000:
-            boost_factor = min(6.0, 5000.0 / float(rms))
-            converted_pcm = audioop.mul(mono_16k, 2, boost_factor)
-        else:
-            converted_pcm = mono_16k
+        converted_pcm = mono_16k
     except Exception:
         # Fallback: step every 12 bytes (3 frames of stereo 16-bit) and take 1 channel
         converted_pcm = bytearray()
@@ -230,7 +224,41 @@ class STTVoiceSink(AudioSinkBase):
                 self.user_last_spoke.pop(uid, None)
                 uinfo = self.user_info.get(uid, {"id": str(uid), "username": "Speaker"})
                 if raw_pcm:
+                    # Energy VAD: ignore pure silence / low background noise
+                    try:
+                        try:
+                            import audioop
+                        except ImportError:
+                            import audioop_lts as audioop
+                        rms = audioop.rms(raw_pcm, 2)
+                    except Exception:
+                        rms = 1000
+                    if rms < 350:
+                        continue
                     asyncio.create_task(self._process_stt(uid, uinfo, raw_pcm))
+
+    def _is_whisper_hallucination(self, text: str) -> bool:
+        """Filter out common Whisper hallucinations generated on silence or low noise."""
+        cleaned = text.lower().strip()
+        hallucinations = [
+            "продолжение следует",
+            "субтитры сделал",
+            "субтитры добавил",
+            "редактор субтитров",
+            "корректор",
+            "перевод и субтитры",
+            "спасибо за просмотр",
+            "подписывайтесь",
+            "ставьте лайк",
+            "thank you for watching",
+            "thanks for watching",
+            "please subscribe",
+            "dimatorzok",
+            "диматорзок",
+            "semkin",
+            "семкин",
+        ]
+        return any(h in cleaned for h in hallucinations)
 
     async def _process_stt(self, uid: int, uinfo: Dict[str, Any], raw_pcm: bytes) -> None:
         dbg_log = _get_data_dir() / "voice_debug.log"
@@ -259,15 +287,22 @@ class STTVoiceSink(AudioSinkBase):
                 form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                 form.add_field("model", model)
                 form.add_field("language", lang)
+                form.add_field("prompt", "Разговорная речь в голосовом чате Discord.")
+                form.add_field("temperature", "0.0")
                 headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=12) as resp:
                         if resp.status == 200:
                             data = await resp.json()
-                            text = data.get("text", "").strip()
-                            with open(dbg_log, "a") as f:
-                                f.write(f"[{datetime.now()}] Whisper ({model}) recognized for {uinfo.get('username')}: '{text}' ({len(raw_pcm)} bytes)\n")
+                            candidate = data.get("text", "").strip()
+                            if self._is_whisper_hallucination(candidate):
+                                with open(dbg_log, "a") as f:
+                                    f.write(f"[{datetime.now()}] Whisper hallucination ignored: '{candidate}'\n")
+                            else:
+                                text = candidate
+                                with open(dbg_log, "a") as f:
+                                    f.write(f"[{datetime.now()}] Whisper ({model}) recognized for {uinfo.get('username')}: '{text}' ({len(raw_pcm)} bytes)\n")
                         else:
                             err_body = await resp.text()
                             with open(dbg_log, "a") as f:
@@ -276,7 +311,7 @@ class STTVoiceSink(AudioSinkBase):
                 with open(dbg_log, "a") as f:
                     f.write(f"[{datetime.now()}] Whisper API error: {e}, falling back to Google\n")
 
-        # 3. Fallback to Google Web Speech API if Whisper did not return text
+        # 3. Fallback to Google Web Speech API if Whisper did not return valid text
         if not text:
             def _google_transcribe():
                 try:
@@ -287,8 +322,9 @@ class STTVoiceSink(AudioSinkBase):
                     return ""
 
             loop = asyncio.get_event_loop()
-            text = await loop.run_in_executor(None, _google_transcribe)
-            if text:
+            candidate = await loop.run_in_executor(None, _google_transcribe)
+            if candidate and not self._is_whisper_hallucination(candidate):
+                text = candidate
                 with open(dbg_log, "a") as f:
                     f.write(f"[{datetime.now()}] Google STT recognized for {uinfo.get('username')}: '{text}'\n")
 
