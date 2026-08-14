@@ -270,12 +270,20 @@ class KasperyaEnergyVad:
 class STTVoiceSink(AudioSinkBase):
     """Real-time Voice Receiver and Speech-to-Text Sink using Kasperya Energy VAD."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.6, stt_config: Optional[Dict[str, Any]] = None):
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.6, stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
         super().__init__()
         self.callback = callback
         self.language = language
         self.silence_threshold = silence_threshold_seconds
         self.stt_config = stt_config or {}
+        try:
+            self.loop = loop or asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self.loop = loop or asyncio.get_event_loop()
+            except RuntimeError:
+                self.loop = None
+
         self.user_vads: Dict[int, KasperyaEnergyVad] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
         self.packets_received: int = 0
@@ -285,11 +293,9 @@ class STTVoiceSink(AudioSinkBase):
         self.speakers: set = set()
         self._running = True
         self._check_task: Optional[Any] = None
-        try:
-            loop = asyncio.get_running_loop()
-            self._check_task = loop.create_task(self._silence_checker())
-        except RuntimeError:
-            pass
+
+        if self.loop and self.loop.is_running():
+            self._check_task = self.loop.create_task(self._silence_checker())
 
     def wants_opus(self) -> bool:
         return False
@@ -307,11 +313,9 @@ class STTVoiceSink(AudioSinkBase):
         uid = user_id or ssrc or 0
         uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
 
-        if self._check_task is None or self._check_task.done():
+        if (self._check_task is None or self._check_task.done()) and self.loop and self.loop.is_running():
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    self._check_task = loop.create_task(self._silence_checker())
+                self._check_task = self.loop.create_task(self._silence_checker())
             except Exception:
                 pass
 
@@ -344,7 +348,8 @@ class STTVoiceSink(AudioSinkBase):
                     wf_out.write(wav_bytes)
             except Exception:
                 pass
-            asyncio.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._process_stt_wav(uid, uinfo, wav_bytes), self.loop)
 
     async def _silence_checker(self) -> None:
         while self._running:
@@ -359,7 +364,6 @@ class STTVoiceSink(AudioSinkBase):
                             wf_out.write(wav_bytes)
                     except Exception:
                         pass
-
                     asyncio.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
 
     def _is_whisper_hallucination(self, text: str) -> bool:
@@ -575,7 +579,8 @@ class VoiceManager:
             except Exception:
                 pass
 
-        sink = STTVoiceSink(callback=on_transcript_cb, language=language, stt_config=stt_config)
+        client_loop = getattr(self._py_client, "loop", None) or asyncio.get_event_loop()
+        sink = STTVoiceSink(callback=on_transcript_cb, language=language, stt_config=stt_config, loop=client_loop)
         if hasattr(vc, "listen"):
             vc.listen(sink)
         self._active_sinks[gid] = sink
