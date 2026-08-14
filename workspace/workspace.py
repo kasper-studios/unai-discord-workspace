@@ -150,10 +150,11 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
 
 class KasperyaEnergyVad:
     """Frame-by-frame energy VAD with Discord DTX silence-gap flushing."""
-    SPEECH_THRESHOLD = 0.012  # RMS ~400 on 48kHz mono
-    MIN_SPEECH_CHUNKS = 3
+    SPEECH_THRESHOLD = 0.0035  # RMS ~115 on unclipped 48kHz mono
+    MIN_SPEECH_CHUNKS = 2
 
-    def __init__(self):
+    def __init__(self, username: str = "Speaker"):
+        self.username = username
         self.is_speaking = False
         self.speech_frames = 0
         self.last_packet_time = 0.0
@@ -182,6 +183,12 @@ class KasperyaEnergyVad:
                 self.buffer = bytearray()
                 for pre in self.pre_roll:
                     self.buffer.extend(pre)
+                try:
+                    dbg_log = _get_data_dir() / "voice_debug.log"
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] VAD speech started for {self.username} (energy={energy:.4f}, rms={rms})\n")
+                except Exception:
+                    pass
         else:
             self.speech_frames = 0
 
@@ -201,10 +208,10 @@ class KasperyaEnergyVad:
             except ImportError:
                 import audioop_lts as audioop
 
-            # Validate speech buffer: minimum 400ms at 48kHz mono (48000 * 2 * 0.4 = 38400 bytes)
-            if len(self.buffer) >= 38400:
+            # Validate speech buffer: minimum 300ms at 48kHz mono (48000 * 2 * 0.3 = 28800 bytes)
+            if len(self.buffer) >= 28800:
                 buf_rms = audioop.rms(self.buffer, 2)
-                if buf_rms >= 300:
+                if buf_rms >= 100:
                     raw_48k = bytes(self.buffer)
                     self.buffer.clear()
                     try:
@@ -215,6 +222,12 @@ class KasperyaEnergyVad:
                         )
                         wav_out, _ = proc.communicate(raw_48k)
                         if wav_out and len(wav_out) > 44:
+                            try:
+                                dbg_log = _get_data_dir() / "voice_debug.log"
+                                with open(dbg_log, "a") as f:
+                                    f.write(f"[{datetime.now()}] VAD speech ended for {self.username} (len={len(raw_48k)} bytes, rms={buf_rms})\n")
+                            except Exception:
+                                pass
                             return wav_out
                     except Exception:
                         pass
@@ -290,7 +303,7 @@ class STTVoiceSink(AudioSinkBase):
                 self.user_vads[user_id] = old_vad
 
         if uid not in self.user_vads:
-            self.user_vads[uid] = KasperyaEnergyVad()
+            self.user_vads[uid] = KasperyaEnergyVad(username=uname)
 
         self.user_info[uid] = {
             "id": str(user_id or uid),
@@ -298,6 +311,7 @@ class STTVoiceSink(AudioSinkBase):
             "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
         }
 
+        self.user_vads[uid].username = uname
         self.user_vads[uid].process_discord_frame(pcm_bytes)
 
     async def _silence_checker(self) -> None:
