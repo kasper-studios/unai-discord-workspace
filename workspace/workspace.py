@@ -76,18 +76,26 @@ try:
         if lib:
             discord.opus.load_opus(lib)
     if hasattr(discord.opus, "Decoder"):
-        _orig_opus_decode = discord.opus.Decoder.decode
+        import ctypes, array
         def _safe_opus_decode(self, data, *, fec=False):
+            channel_count = self.CHANNELS
+            max_frame_size = 5760  # 120ms buffer capacity at 48kHz
+            pcm = (ctypes.c_int16 * (max_frame_size * channel_count))()
+            pcm_ptr = ctypes.cast(pcm, discord.opus.c_int16_ptr)
+
             if not data:
-                data = None
-                fec = False
-            try:
-                return _orig_opus_decode(self, data, fec=fec)
-            except Exception:
-                try:
-                    return _orig_opus_decode(self, None, fec=False)
-                except Exception:
+                ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
+                if ret < 0:
                     return b'\x00' * 3840
+                return array.array('h', pcm[: ret * channel_count]).tobytes()
+
+            ret = discord.opus._lib.opus_decode(self._state, data, len(data), pcm_ptr, max_frame_size, 1 if fec else 0)
+            if ret < 0:
+                ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
+            if ret < 0:
+                return b'\x00' * 3840
+            return array.array('h', pcm[: ret * channel_count]).tobytes()
+
         discord.opus.Decoder.decode = _safe_opus_decode
 except Exception:
     pass
@@ -240,7 +248,9 @@ class STTVoiceSink(AudioSinkBase):
 
     def _is_whisper_hallucination(self, text: str) -> bool:
         """Filter out common Whisper hallucinations generated on silence or low noise."""
-        cleaned = text.lower().strip()
+        cleaned = text.lower().strip().rstrip(".!?,")
+        if cleaned in ["конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд"]:
+            return True
         hallucinations = [
             "продолжение следует",
             "субтитры сделал",
@@ -258,6 +268,7 @@ class STTVoiceSink(AudioSinkBase):
             "диматорзок",
             "semkin",
             "семкин",
+            "благодарю за внимание",
         ]
         return any(h in cleaned for h in hallucinations)
 
