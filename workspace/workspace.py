@@ -442,15 +442,26 @@ class VoiceManager:
                     break
 
         if channel is None:
+            try:
+                channel = await client.fetch_channel(cid)
+            except Exception:
+                pass
+
+        if channel is None:
             raise RuntimeError(f"Voice channel or Guild '{channel_id_str}' not found.")
 
-        guild = channel.guild
-        if guild.voice_client and guild.voice_client.is_connected():
+        guild = getattr(channel, "guild", None)
+        if guild and guild.voice_client and guild.voice_client.is_connected():
             if guild.voice_client.channel.id != channel.id:
                 await guild.voice_client.move_to(channel)
             return guild.voice_client
+        elif guild and guild.voice_client:
+            try:
+                await guild.voice_client.disconnect(force=True)
+            except Exception:
+                pass
 
-        vc = await channel.connect(cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=15.0)
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=20.0)
         return vc
 
     async def start_listening(self, token: str, channel_id_str: str, on_transcript_cb: Any, language: str = "ru-RU", stt_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
