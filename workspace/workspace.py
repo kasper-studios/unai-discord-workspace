@@ -177,14 +177,16 @@ class DiscordSRAudioSource(sr.AudioSource):
         except ImportError:
             import audioop_lts as audioop
 
-        for _ in range(12):
+        # Wait briefly for incoming Discord UDP packets
+        for _ in range(5):
             if len(self.buffer) < size * self.CHANNELS:
-                time.sleep(0.04)
+                time.sleep(0.02)
             else:
                 break
-        else:
-            if len(self.buffer) == 0:
-                return b''
+
+        # If Discord paused packets (DTX), stream continuous silence PCM instead of EOF b''
+        if len(self.buffer) < size * self.CHANNELS:
+            return b'\x00' * (size * 2)
 
         chunksize = size * self.CHANNELS
         audiochunk = self.buffer[:chunksize].tobytes()
@@ -255,7 +257,7 @@ class STTVoiceSink(AudioSinkBase):
             buf = array.array('B')
             self._buffers[uid] = buf
             rec = sr.Recognizer()
-            rec.energy_threshold = 250
+            rec.energy_threshold = 300
             rec.pause_threshold = 0.8
             rec.phrase_threshold = 0.3
             rec.non_speaking_duration = 0.5
@@ -266,6 +268,11 @@ class STTVoiceSink(AudioSinkBase):
                 if not self._running:
                     return
                 try:
+                    # Filter out empty or sub-second clicks (require at least 500ms of 16kHz audio: 16000 * 2 * 0.5 = 16000 bytes)
+                    raw_frames = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
+                    if len(raw_frames) < 16000:
+                        return
+
                     wav_16k = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
                     uinfo = self.user_info.get(uid, {"id": str(uid), "username": uname})
                     try:
