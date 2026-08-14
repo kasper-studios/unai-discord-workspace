@@ -148,17 +148,81 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
     return wav_io.getvalue()
 
 
+class KasperyaEnergyVad:
+    """Frame-by-frame energy VAD ported directly from Kasperya runtime."""
+    SPEECH_THRESHOLD = 0.008
+    SILENCE_THRESHOLD = 0.003
+    MIN_SPEECH_CHUNKS = 3
+    SILENCE_FRAMES_STOP = 35  # ~700ms at 20ms frames
+
+    def __init__(self):
+        self.is_speaking = False
+        self.speech_frames = 0
+        self.silence_frames = 0
+        self.pre_roll = []
+        self.buffer = bytearray()
+        self._rate_state = None
+
+    def process_discord_frame(self, pcm_48k_stereo: bytes) -> Optional[bytes]:
+        try:
+            import audioop
+        except ImportError:
+            import audioop_lts as audioop
+
+        # 1. Convert 48k stereo -> 48k mono
+        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 1, 1)
+        # 2. Resample 48k mono -> 16k mono
+        mono_16k, self._rate_state = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, self._rate_state)
+
+        rms = audioop.rms(mono_16k, 2)
+        energy = rms / 32768.0
+
+        is_speech = energy > self.SPEECH_THRESHOLD
+        is_silence = energy < self.SILENCE_THRESHOLD
+
+        result_phrase = None
+
+        if is_speech:
+            self.speech_frames += 1
+            self.silence_frames = 0
+            if not self.is_speaking and self.speech_frames >= self.MIN_SPEECH_CHUNKS:
+                self.is_speaking = True
+                self.buffer = bytearray()
+                for pre in self.pre_roll:
+                    self.buffer.extend(pre)
+        else:
+            self.speech_frames = 0
+            if self.is_speaking and is_silence:
+                self.silence_frames += 1
+                if self.silence_frames >= self.SILENCE_FRAMES_STOP:
+                    self.is_speaking = False
+                    self.silence_frames = 0
+                    # Minimum 400ms of speech (16000 * 2 * 0.4 = 12800 bytes)
+                    if len(self.buffer) >= 12800:
+                        result_phrase = bytes(self.buffer)
+                    self.buffer.clear()
+            elif self.is_speaking and not is_silence:
+                self.silence_frames = 0
+
+        if self.is_speaking:
+            self.buffer.extend(mono_16k)
+        else:
+            self.pre_roll.append(mono_16k)
+            if len(self.pre_roll) > 5:
+                self.pre_roll.pop(0)
+
+        return result_phrase
+
+
 class STTVoiceSink(AudioSinkBase):
-    """Real-time Voice Receiver and Speech-to-Text Sink for Discord channels using DiscordSRAudioSource."""
+    """Real-time Voice Receiver and Speech-to-Text Sink using Kasperya Energy VAD."""
 
     def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.8, stt_config: Optional[Dict[str, Any]] = None):
         super().__init__()
         self.callback = callback
         self.language = language
         self.stt_config = stt_config or {}
-        self.user_buffers: Dict[int, array.array] = {}
-        self.user_stoppers: Dict[int, Any] = {}
-        self.user_recognizers: Dict[int, sr.Recognizer] = {}
+        self.user_vads: Dict[int, KasperyaEnergyVad] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
         self.packets_received: int = 0
         self.bytes_received: int = 0
@@ -197,86 +261,47 @@ class STTVoiceSink(AudioSinkBase):
             except Exception:
                 pass
 
-        # If we have an active SSRC stream and user is identified, migrate
-        if ssrc and user_id and ssrc != user_id and ssrc in self.user_buffers:
-            self._drop_user(ssrc)
+        if ssrc and user_id and ssrc != user_id and ssrc in self.user_vads:
+            old_vad = self.user_vads.pop(ssrc)
+            if user_id not in self.user_vads:
+                self.user_vads[user_id] = old_vad
 
-        if uid not in self.user_buffers:
-            self.user_buffers[uid] = array.array("B")
-            self.user_info[uid] = {
-                "id": str(user_id or uid),
-                "username": uname,
-                "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
-            }
-            r = sr.Recognizer()
-            r.energy_threshold = 400
-            r.dynamic_energy_threshold = False
-            r.pause_threshold = 0.8
-            self.user_recognizers[uid] = r
+        if uid not in self.user_vads:
+            self.user_vads[uid] = KasperyaEnergyVad()
+
+        self.user_info[uid] = {
+            "id": str(user_id or uid),
+            "username": uname,
+            "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
+        }
+
+        vad = self.user_vads[uid]
+        phrase_pcm = vad.process_discord_frame(pcm_bytes)
+        if phrase_pcm:
+            # Build clean 16kHz mono WAV
+            wav_io = io.BytesIO()
+            with wave.open(wav_io, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(phrase_pcm)
+            wav_bytes = wav_io.getvalue()
+
+            uinfo = self.user_info.get(uid, {"id": str(uid), "username": uname})
+            try:
+                with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
+                    wf_out.write(wav_bytes)
+            except Exception:
+                pass
 
             try:
-                from discord.ext.voice_recv.extras import speechrecognition as _sr_extra
-                source = _sr_extra.DiscordSRAudioSource(self.user_buffers[uid])
-                self.user_stoppers[uid] = r.listen_in_background(
-                    source, self._make_phrase_callback(uid), phrase_time_limit=15
-                )
-            except Exception as e:
-                dbg_log = _get_data_dir() / "voice_debug.log"
-                with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] Failed to spawn listen_in_background for {uname}: {e}\n")
-
-        self.user_buffers[uid].extend(pcm_bytes)
-
-    def _make_phrase_callback(self, uid: int):
-        def _on_phrase(recognizer: sr.Recognizer, audio: sr.AudioData):
-            if not self._running:
-                return
-            try:
-                raw = audio.get_raw_data()
-                if not raw:
-                    return
-
-                duration_sec = len(raw) / (audio.sample_rate * audio.sample_width)
-                if duration_sec < 0.4:
-                    return
-
-                # Calculate RMS
-                try:
-                    try:
-                        import audioop
-                    except ImportError:
-                        import audioop_lts as audioop
-                    rms = audioop.rms(raw, audio.sample_width)
-                except Exception:
-                    rms = 500
-
-                if rms < 250:
-                    return
-
-                wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
-                if len(wav_bytes) < 1000:
-                    return
-
-                uinfo = self.user_info.get(uid, {"id": str(uid), "username": "Speaker"})
-                try:
-                    with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
-                        wf_out.write(wav_bytes)
-                except Exception:
-                    pass
-
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        loop.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
-                    else:
-                        asyncio.run(self._process_stt_wav(uid, uinfo, wav_bytes))
-                except Exception:
-                    pass
-            except Exception as e:
-                dbg_log = _get_data_dir() / "voice_debug.log"
-                with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] Background STT callback error: {e}\n")
-        return _on_phrase
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._process_stt_wav(uid, uinfo, wav_bytes))
+                else:
+                    asyncio.run(self._process_stt_wav(uid, uinfo, wav_bytes))
+            except Exception:
+                pass
 
     def _is_whisper_hallucination(self, text: str) -> bool:
         """Filter out common Whisper hallucinations generated on silence or low noise."""
@@ -312,7 +337,7 @@ class STTVoiceSink(AudioSinkBase):
         provider = cfg.get("provider", "omniroute")
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
-        model = cfg.get("model", "groq/whisper-large-v3-turbo")
+        model = cfg.get("model", "groq/whisper-large-v3")
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
 
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
@@ -348,7 +373,7 @@ class STTVoiceSink(AudioSinkBase):
         if not text:
             def _google_transcribe():
                 try:
-                    r = self.user_recognizers.get(uid) or sr.Recognizer()
+                    r = sr.Recognizer()
                     with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
                         audio_data = r.record(source)
                     return r.recognize_google(audio_data, language=self.language)
@@ -378,14 +403,7 @@ class STTVoiceSink(AudioSinkBase):
                 self.callback(notif)
 
     def _drop_user(self, uid: int) -> None:
-        stopper = self.user_stoppers.pop(uid, None)
-        if stopper:
-            try:
-                stopper(wait_for_stop=False)
-            except Exception:
-                pass
-        self.user_buffers.pop(uid, None)
-        self.user_recognizers.pop(uid, None)
+        self.user_vads.pop(uid, None)
         self.user_info.pop(uid, None)
 
     def get_stats(self) -> Dict[str, Any]:
@@ -400,8 +418,7 @@ class STTVoiceSink(AudioSinkBase):
 
     def cleanup(self) -> None:
         self._running = False
-        for uid in tuple(self.user_buffers.keys()):
-            self._drop_user(uid)
+        self.user_vads.clear()
 
 
 class VoiceManager:
