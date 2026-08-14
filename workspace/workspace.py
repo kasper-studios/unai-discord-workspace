@@ -178,7 +178,7 @@ class UserVoiceBuffer:
     isolated noise clicks, and flushes valid speech phrases on pauses.
     """
 
-    def __init__(self, uid: int, uname: str, energy_threshold: int = 450):
+    def __init__(self, uid: int, uname: str, energy_threshold: int = 900):
         self.uid = uid
         self.uname = uname
         self.energy_threshold = energy_threshold  # RMS threshold for voiced frame
@@ -207,8 +207,8 @@ class UserVoiceBuffer:
         if not self.is_speaking:
             if is_voice:
                 self.consecutive_voice_frames += 1
-                # Require 3 consecutive voice frames (~60ms) to trigger speech start, avoiding micro-pops
-                if self.consecutive_voice_frames >= 3:
+                # Require 4 consecutive voice frames (~80ms) to trigger speech start, avoiding micro-pops/breaths
+                if self.consecutive_voice_frames >= 4:
                     self.is_speaking = True
                     self.phrase_start_time = now
                     self.phrase_frames = list(self.pre_buffer) + [pcm_bytes]
@@ -230,8 +230,8 @@ class UserVoiceBuffer:
         else:
             self.silence_frame_count += 1
 
-        # End of phrase condition 1: ~700ms (35 frames) of silence
-        if self.silence_frame_count >= 35:
+        # End of phrase condition 1: ~600ms (30 frames) of silence
+        if self.silence_frame_count >= 30:
             return self._flush_phrase()
 
         # End of phrase condition 2: max phrase duration ~15s (750 frames)
@@ -240,7 +240,7 @@ class UserVoiceBuffer:
 
         return None
 
-    def flush_if_timed_out(self, now: float, timeout: float = 0.75) -> Optional[Tuple[bytes, float, float]]:
+    def flush_if_timed_out(self, now: float, timeout: float = 0.70) -> Optional[Tuple[bytes, float, float]]:
         """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
         if self.is_speaking and (now - self.last_packet_time >= timeout):
             return self._flush_phrase()
@@ -268,8 +268,8 @@ class UserVoiceBuffer:
         avg_rms = voiced_rms / max(1, voiced_cnt)
         voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Validation: phrase must be >= 0.8s, have >= 18 voiced frames (~360ms), voiced ratio >= 30%, and avg RMS >= 450
-        if duration_sec < 0.8 or voiced_cnt < 18 or voiced_ratio < 0.30 or avg_rms < 450:
+        # Validation: phrase must be >= 1.0s, have >= 22 voiced frames (~440ms), voiced ratio >= 35%, and avg RMS >= 750
+        if duration_sec < 1.0 or voiced_cnt < 22 or voiced_ratio < 0.35 or avg_rms < 750:
             return None
 
         raw_pcm = b"".join(frames)
@@ -466,7 +466,7 @@ class STTVoiceSink(AudioSinkBase):
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
-        preferred_model = cfg.get("model", "groq/whisper-large-v3-turbo")
+        preferred_model = cfg.get("model", "groq/whisper-large-v3")
 
         models_to_try = [preferred_model]
         if "groq/whisper-large-v3" not in models_to_try:
@@ -493,10 +493,7 @@ class STTVoiceSink(AudioSinkBase):
                             if resp.status == 200:
                                 data = await resp.json()
                                 candidate = data.get("text", "").strip()
-                                if self._is_whisper_hallucination(candidate):
-                                    with open(dbg_log, "a") as f:
-                                        f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) hallucination ignored for {username}: '{candidate}'\n")
-                                else:
+                                if not self._is_whisper_hallucination(candidate):
                                     text = candidate
                                     with open(dbg_log, "a") as f:
                                         f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Whisper ({model}) for {username}: '{text}'\n")
@@ -770,7 +767,7 @@ class DiscordWorkspace(Workspace):
                 "provider": "omniroute",
                 "api_base": "http://localhost:20128/v1",
                 "api_key": "omniroute",
-                "model": "groq/whisper-large-v3-turbo",
+                "model": "groq/whisper-large-v3",
                 "language": "ru"
             }
             self._save_stt_config()
