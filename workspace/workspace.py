@@ -9,11 +9,16 @@ Follows ADR-0004 for one-shot login tool state management.
 
 import asyncio
 import base64
+from datetime import datetime
+import io
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional
+import wave
 import aiohttp
+import speech_recognition as sr
 
 from unai.sdk import Workspace, tool
 
@@ -63,11 +68,127 @@ def _get_token_file() -> Path:
     return _get_data_dir() / "session.json"
 
 
+try:
+    from discord.ext import voice_recv
+    AudioSinkBase = voice_recv.AudioSink
+except Exception:
+    class AudioSinkBase:
+        pass
+
+
+class STTVoiceSink(AudioSinkBase):
+    """Real-time Voice Receiver and Speech-to-Text Sink for Discord channels."""
+
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 1.0):
+        super().__init__()
+        self.callback = callback
+        self.language = language
+        self.silence_threshold = silence_threshold_seconds
+        self.user_buffers: Dict[int, bytearray] = {}
+        self.user_last_spoke: Dict[int, float] = {}
+        self.user_info: Dict[int, Dict[str, Any]] = {}
+        self.recognizer = sr.Recognizer()
+        self.recognizer.energy_threshold = 300
+        self._running = True
+        self._check_task = asyncio.create_task(self._silence_checker())
+
+    def wants_opus(self) -> bool:
+        return False
+
+    def write(self, user: Optional[Any], data: Any) -> None:
+        if not self._running or not getattr(data, "pcm", None):
+            return
+
+        uid = getattr(user, "id", None) or (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0) or 0)
+        uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
+
+        now = time.time()
+        if uid not in self.user_buffers:
+            self.user_buffers[uid] = bytearray()
+            self.user_info[uid] = {
+                "id": str(uid),
+                "username": uname,
+                "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
+            }
+
+        self.user_buffers[uid].extend(data.pcm)
+        self.user_last_spoke[uid] = now
+
+    async def _silence_checker(self) -> None:
+        while self._running:
+            await asyncio.sleep(0.3)
+            now = time.time()
+            to_flush = []
+            for uid, last_time in list(self.user_last_spoke.items()):
+                buf_len = len(self.user_buffers.get(uid, b""))
+                # 48000 Hz * 2 channels * 2 bytes = 192,000 bytes per second
+                if now - last_time >= self.silence_threshold and buf_len > 192000 * 0.4:
+                    to_flush.append(uid)
+                elif now - last_time >= self.silence_threshold and buf_len <= 192000 * 0.4:
+                    self.user_buffers.pop(uid, None)
+                    self.user_last_spoke.pop(uid, None)
+
+            for uid in to_flush:
+                raw_pcm = bytes(self.user_buffers.pop(uid, b""))
+                self.user_last_spoke.pop(uid, None)
+                uinfo = self.user_info.get(uid, {"id": str(uid), "username": "Speaker"})
+                if raw_pcm:
+                    asyncio.create_task(self._process_stt(uid, uinfo, raw_pcm))
+
+    async def _process_stt(self, uid: int, uinfo: Dict[str, Any], raw_pcm: bytes) -> None:
+        loop = asyncio.get_event_loop()
+
+        def _transcribe():
+            try:
+                wav_io = io.BytesIO()
+                with wave.open(wav_io, "wb") as wf:
+                    wf.setnchannels(2)
+                    wf.setsampwidth(2)
+                    wf.setframerate(48000)
+                    wf.writeframes(raw_pcm)
+                wav_io.seek(0)
+
+                with sr.AudioFile(wav_io) as source:
+                    audio_data = self.recognizer.record(source)
+
+                try:
+                    return self.recognizer.recognize_google(audio_data, language=self.language)
+                except sr.UnknownValueError:
+                    return ""
+                except Exception:
+                    return ""
+            except Exception:
+                return ""
+
+        text = await loop.run_in_executor(None, _transcribe)
+        if text and text.strip():
+            notif = {
+                "id": str(int(time.time() * 1000)),
+                "type": "voice_transcript",
+                "user_id": uinfo.get("id"),
+                "username": uinfo.get("username"),
+                "text": text.strip(),
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "language": self.language,
+                "read": False,
+            }
+            if self.callback:
+                self.callback(notif)
+
+    def cleanup(self) -> None:
+        self._running = False
+        if self._check_task:
+            self._check_task.cancel()
+        self.user_buffers.clear()
+        self.user_last_spoke.clear()
+
+
 class VoiceManager:
     """Voice Connection & Media Streaming Manager for Discord channels."""
 
     def __init__(self):
         self._py_client: Optional[Any] = None
+        self._active_sinks: Dict[int, Any] = {}
 
     async def get_py_client(self, token: str) -> Any:
         import discord
@@ -108,6 +229,8 @@ class VoiceManager:
         return self._py_client
 
     async def get_or_connect(self, token: str, channel_id_str: str) -> Any:
+        from discord.ext import voice_recv
+
         client = await self.get_py_client(token)
         cid = int(channel_id_str)
 
@@ -128,8 +251,53 @@ class VoiceManager:
                 await guild.voice_client.move_to(channel)
             return guild.voice_client
 
-        vc = await channel.connect(reconnect=True, timeout=15.0)
+        vc = await channel.connect(cls=voice_recv.VoiceRecvClient, reconnect=True, timeout=15.0)
         return vc
+
+    async def start_listening(self, token: str, channel_id_str: str, on_transcript_cb: Any, language: str = "ru-RU") -> Dict[str, Any]:
+        vc = await self.get_or_connect(token, channel_id_str)
+        gid = vc.guild.id
+
+        if gid in self._active_sinks:
+            try:
+                if hasattr(vc, "stop_listening"):
+                    vc.stop_listening()
+                self._active_sinks[gid].cleanup()
+            except Exception:
+                pass
+
+        sink = STTVoiceSink(callback=on_transcript_cb, language=language)
+        if hasattr(vc, "listen"):
+            vc.listen(sink)
+        self._active_sinks[gid] = sink
+        return {
+            "channel_id": str(vc.channel.id),
+            "channel_name": vc.channel.name,
+            "guild_id": str(gid),
+            "guild_name": vc.guild.name,
+            "listening": True,
+            "language": language,
+            "info": f"Started Voice Listener in Voice Channel '{vc.channel.name}' on '{vc.guild.name}'. Incoming speech is captured, transcribed via STT, and piped to transcripts feed."
+        }
+
+    async def stop_listening(self, token: str, channel_id_str: str) -> str:
+        client = await self.get_py_client(token)
+        cid = int(channel_id_str) if channel_id_str.isdigit() else 0
+        for gid, sink in list(self._active_sinks.items()):
+            g = client.get_guild(gid)
+            if cid == 0 or gid == cid or (g and g.get_channel(cid)):
+                try:
+                    if g and g.voice_client and hasattr(g.voice_client, "stop_listening"):
+                        g.voice_client.stop_listening()
+                except Exception:
+                    pass
+                sink.cleanup()
+                self._active_sinks.pop(gid, None)
+                return f"Voice Listener stopped for guild {gid}."
+        return "No active Voice Listener was found for this channel/guild."
+
+    def is_listening(self, guild_id: int) -> bool:
+        return guild_id in self._active_sinks
 
 
 class DiscordWorkspace(Workspace):
@@ -2024,24 +2192,25 @@ class DiscordWorkspace(Workspace):
         },
     )
     async def voice_listen_start(self, channel_id: str, language: str = "ru-RU", reason: Optional[str] = None) -> Dict[str, Any]:
-        vc = await self._voice_manager.get_or_connect(self._token, channel_id)
-        return {
-            "channel_id": str(vc.channel.id),
-            "guild_id": str(vc.guild.id),
-            "listening": True,
-            "language": language,
-            "info": f"Started Voice Listener in Voice Channel '{vc.channel.name}'. Incoming speech will be transcribed and stored in voice transcripts feed.",
-        }
+        return await self._voice_manager.start_listening(
+            token=self._token,
+            channel_id_str=channel_id,
+            on_transcript_cb=self._add_voice_transcript,
+            language=language,
+        )
 
     @tool(
         "discord.voice.listen_stop",
-        description="Stop active Voice Listener in a Voice Channel",
+        description="Stop active Voice Listener in a Voice Channel or Guild",
         arguments={
             "channel_id": {"type": "string", "description": "Voice Channel ID or Guild ID"}
         },
     )
     async def voice_listen_stop(self, channel_id: str, reason: Optional[str] = None) -> str:
-        return f"Voice Listener stopped for channel/guild '{channel_id}'."
+        return await self._voice_manager.stop_listening(
+            token=self._token,
+            channel_id_str=channel_id,
+        )
 
     @tool(
         "discord.voice.transcripts_feed",
