@@ -130,10 +130,27 @@ except Exception:
 
 
 def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
-    """Convert raw 48000Hz 16-bit stereo PCM from Discord to clean 16kHz mono WAV."""
+    """Convert raw 48000Hz 16-bit stereo PCM from Discord to clean, normalized 16kHz mono WAV."""
     try:
         mono_48k = audioop.tomono(raw_pcm, 2, 0.5, 0.5)
         mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
+
+        # DC offset removal
+        try:
+            avg = audioop.avg(mono_16k, 2)
+            mono_16k = audioop.bias(mono_16k, 2, -avg)
+        except Exception:
+            pass
+
+        # RMS volume normalization (boost low-volume speech to healthy target RMS ~9000)
+        try:
+            cur_rms = audioop.rms(mono_16k, 2)
+            if cur_rms > 0:
+                factor = min(4.0, max(0.5, 9000.0 / cur_rms))
+                mono_16k = audioop.mul(mono_16k, 2, factor)
+        except Exception:
+            pass
+
         wav_io = io.BytesIO()
         with wave.open(wav_io, "wb") as wf:
             wf.setnchannels(1)
@@ -457,6 +474,9 @@ class STTVoiceSink(AudioSinkBase):
         if "groq/whisper-large-v3-turbo" not in models_to_try:
             models_to_try.append("groq/whisper-large-v3-turbo")
 
+        # Priming prompt primes Whisper into dialogue mode, suppressing subtitle dataset tokens
+        priming_prompt = "Привет! Как твои дела? Давай поговорим." if "ru" in lang else "Hello! How are you doing? Let's talk."
+
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
             for model in models_to_try:
                 try:
@@ -464,6 +484,7 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                     form.add_field("model", model)
                     form.add_field("language", lang)
+                    form.add_field("prompt", priming_prompt)
                     form.add_field("temperature", "0")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
