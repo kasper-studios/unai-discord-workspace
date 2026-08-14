@@ -420,37 +420,40 @@ class STTVoiceSink(AudioSinkBase):
         provider = cfg.get("provider", "omniroute")
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
-        model = "groq/whisper-large-v3"
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
 
-        if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
-            try:
-                form = aiohttp.FormData()
-                form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
-                form.add_field("model", model)
-                form.add_field("language", lang)
-                form.add_field("temperature", "0.0")
-                headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        # Models with fallback on 429 rate limit or server error
+        models_to_try = ["groq/whisper-large-v3", "groq/whisper-large-v3-turbo"]
 
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=12) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            candidate = data.get("text", "").strip()
-                            if self._is_whisper_hallucination(candidate):
-                                with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] ⚠️ Whisper hallucination ignored for {username}: '{candidate}'\n")
+        if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
+            for model in models_to_try:
+                try:
+                    form = aiohttp.FormData()
+                    form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+                    form.add_field("model", model)
+                    form.add_field("language", lang)
+                    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=12) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                candidate = data.get("text", "").strip()
+                                if self._is_whisper_hallucination(candidate):
+                                    with open(dbg_log, "a") as f:
+                                        f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) hallucination ignored for {username}: '{candidate}'\n")
+                                else:
+                                    text = candidate
+                                    with open(dbg_log, "a") as f:
+                                        f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Whisper ({model}) for {username}: '{text}'\n")
+                                break
                             else:
-                                text = candidate
+                                err_body = await resp.text()
                                 with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Whisper ({model}) for {username}: '{text}'\n")
-                        else:
-                            err_body = await resp.text()
-                            with open(dbg_log, "a") as f:
-                                f.write(f"[{datetime.now()}] ❌ Whisper API status {resp.status}: {err_body[:200]}\n")
-            except Exception as e:
-                with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] ❌ Whisper API error: {e}, falling back to Google\n")
+                                    f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) status {resp.status}: {err_body[:120]}, trying fallback...\n")
+                except Exception as e:
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) error: {e}, trying fallback...\n")
 
         # Fallback to Google Web Speech API
         if not text:
