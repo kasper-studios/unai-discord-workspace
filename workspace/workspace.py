@@ -102,16 +102,31 @@ except Exception:
         pass
 
 
-def _pcm_to_wav(raw_pcm: bytes, rate: int = 48000, channels: int = 2) -> io.BytesIO:
-    """Convert raw 48000Hz 16-bit 2-channel PCM from Discord to standard WAV container."""
+def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
+    """Convert raw 48000Hz 16-bit stereo PCM from Discord to clean 16kHz mono WAV using ffmpeg filter."""
+    try:
+        proc = subprocess.Popen(
+            [
+                "ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
+                "-af", "highpass=f=80,lowpass=f=8000,volume=1.5", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        wav_bytes, _ = proc.communicate(raw_pcm)
+        if wav_bytes and len(wav_bytes) > 44:
+            return wav_bytes
+    except Exception:
+        pass
+
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wf:
-        wf.setnchannels(channels)
+        wf.setnchannels(2)
         wf.setsampwidth(2)
-        wf.setframerate(rate)
+        wf.setframerate(48000)
         wf.writeframes(raw_pcm)
-    wav_io.seek(0)
-    return wav_io
+    return wav_io.getvalue()
 
 
 class STTVoiceSink(AudioSinkBase):
@@ -250,9 +265,8 @@ class STTVoiceSink(AudioSinkBase):
         dbg_log = _get_data_dir() / "voice_debug.log"
         text = ""
 
-        # 1. Convert to lossless 48kHz stereo WAV in-memory
-        wav_io = _pcm_to_wav(raw_pcm, rate=48000, channels=2)
-        wav_bytes = wav_io.getvalue()
+        # 1. Convert to conditioned 16kHz mono WAV in-memory
+        wav_bytes = _pcm_to_clean_wav(raw_pcm)
         try:
             with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
                 wf_out.write(wav_bytes)
