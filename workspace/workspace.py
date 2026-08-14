@@ -351,6 +351,7 @@ class DiscordWorkspace(Workspace):
         self._voice_manager: VoiceManager = VoiceManager()
         self._voice_transcripts_cache: List[Dict[str, Any]] = []
         self._music_config: Dict[str, Any] = {}
+        self._active_tracks: Dict[int, Dict[str, Any]] = {}
         self._hermes_webhook_url: Optional[str] = None
         self._load_saved_token()
         self._load_notifications_cache()
@@ -1971,7 +1972,7 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.voice.stop",
-        description="Stop current active voice audio playback in Voice Channel",
+        description="Stop current active voice audio/music playback in Voice Channel",
         arguments={
             "channel_id": {"type": "string", "description": "Voice Channel ID or Guild ID"}
         },
@@ -1981,12 +1982,42 @@ class DiscordWorkspace(Workspace):
         cid = int(channel_id)
         for g in client.guilds:
             if g.voice_client and (g.id == cid or g.voice_client.channel.id == cid):
+                self._active_tracks.pop(g.id, None)
                 if g.voice_client.is_playing():
                     g.voice_client.stop()
                     return f"Audio playback stopped in Voice Channel '{g.voice_client.channel.name}'."
                 return f"No audio is currently playing in Voice Channel '{g.voice_client.channel.name}'."
 
         return f"No active voice connection found for ID '{channel_id}'."
+
+    @tool(
+        "discord.voice.music_status",
+        description="Get current playing track metadata, elapsed time, and status in Voice Channel",
+        arguments={
+            "channel_id": {"type": "string", "description": "Voice Channel ID or Guild ID"}
+        },
+    )
+    async def voice_music_status(self, channel_id: str, reason: Optional[str] = None) -> Dict[str, Any]:
+        client = await self._voice_manager.get_py_client(self._token)
+        cid = int(channel_id)
+        for g in client.guilds:
+            if g.voice_client and (g.id == cid or g.voice_client.channel.id == cid):
+                vc = g.voice_client
+                is_playing = vc.is_playing()
+                track = self._active_tracks.get(g.id, {}) if is_playing else {}
+                elapsed = int(time.time() - track.get("start_time", time.time())) if track else 0
+                return {
+                    "connected": vc.is_connected(),
+                    "channel_id": str(vc.channel.id),
+                    "channel_name": vc.channel.name,
+                    "guild_id": str(g.id),
+                    "guild_name": g.name,
+                    "is_playing": is_playing,
+                    "elapsed_seconds": elapsed,
+                    "track": track if is_playing else None,
+                    "info": f"Track '{track.get('title', 'Unknown')}' is currently playing ({elapsed}s elapsed)" if is_playing else "No track is currently playing.",
+                }
+        return {"connected": False, "is_playing": False, "info": f"No active voice connection found for ID '{channel_id}'."}
 
     # ====================================================================
     # Roles, Server Moderation, Invites & Threads Tools
@@ -2226,13 +2257,15 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.voice.play_music",
-        description="Search, download (to /tmp), and play music or audio tracks from YouTube or URL directly in a Discord Voice Channel (supports custom cookies and browser cookies)",
+        description="Search, download (to /tmp), and play music or audio tracks from YouTube or URL directly in a Discord Voice Channel (supports custom cookies, browser cookies, and request_id idempotency)",
         arguments={
             "channel_id": {"type": "string", "description": "Target Voice Channel ID or Guild ID"},
             "query_or_url": {"type": "string", "description": "Search query or YouTube/Soundcloud URL to play"},
             "volume": {"type": "number", "description": "Volume level (0.1 to 2.0)", "default": 1.0},
             "cookie_file": {"type": "string", "description": "Optional custom cookies.txt path for this playback", "default": ""},
-            "browser": {"type": "string", "description": "Optional browser to read cookies from for this playback", "default": ""}
+            "browser": {"type": "string", "description": "Optional browser to read cookies from for this playback", "default": ""},
+            "request_id": {"type": "string", "description": "Optional unique request ID / idempotency key to prevent duplicate playback on retries", "default": ""},
+            "force_restart": {"type": "boolean", "description": "Whether to force restart track if already playing", "default": False}
         },
     )
     async def voice_play_music(
@@ -2242,6 +2275,8 @@ class DiscordWorkspace(Workspace):
         volume: float = 1.0,
         cookie_file: str = "",
         browser: str = "",
+        request_id: str = "",
+        force_restart: bool = False,
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         import yt_dlp
@@ -2250,6 +2285,29 @@ class DiscordWorkspace(Workspace):
 
         if not query_or_url:
             raise RuntimeError("query_or_url parameter is required.")
+
+        vc = await self._voice_manager.get_or_connect(self._token, channel_id)
+        gid = vc.guild.id
+
+        # Idempotency check: If already playing this track / request in this guild
+        if vc.is_playing() and not force_restart:
+            curr = self._active_tracks.get(gid)
+            if curr:
+                same_req = request_id and curr.get("request_id") == request_id
+                same_query = curr.get("query_or_url") == query_or_url.strip() or curr.get("url") == query_or_url.strip()
+                if same_req or same_query:
+                    elapsed = int(time.time() - curr.get("start_time", time.time()))
+                    return {
+                        "status": "already_playing",
+                        "channel_id": str(vc.channel.id),
+                        "channel_name": vc.channel.name,
+                        "guild_id": str(gid),
+                        "guild_name": vc.guild.name,
+                        "track_meta": curr,
+                        "elapsed_seconds": elapsed,
+                        "volume": volume,
+                        "info": f"Track '{curr.get('title', 'Audio')}' is already playing in '{vc.channel.name}' ({elapsed}s elapsed). Use force_restart=true to restart.",
+                    }
 
         track_id = str(uuid.uuid4())[:8]
         out_tmpl = f"/tmp/unai_music_{track_id}.%(ext)s"
@@ -2307,6 +2365,14 @@ class DiscordWorkspace(Workspace):
 
         track_meta = await loop.run_in_executor(None, _download)
         res = await self.voice_play_file(channel_id=channel_id, file_path=track_meta["file_path"], volume=volume)
+
+        # Track active playback
+        track_meta["query_or_url"] = query_or_url.strip()
+        track_meta["request_id"] = request_id or track_id
+        track_meta["start_time"] = time.time()
+        track_meta["volume"] = volume
+        self._active_tracks[gid] = track_meta
+
         res["track_meta"] = track_meta
         return res
 
