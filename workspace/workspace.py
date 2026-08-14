@@ -81,7 +81,13 @@ try:
             if not data:
                 data = None
                 fec = False
-            return _orig_opus_decode(self, data, fec=fec)
+            try:
+                return _orig_opus_decode(self, data, fec=fec)
+            except Exception:
+                try:
+                    return _orig_opus_decode(self, None, fec=False)
+                except Exception:
+                    return b'\x00' * 3840
         discord.opus.Decoder.decode = _safe_opus_decode
 except Exception:
     pass
@@ -336,7 +342,6 @@ class STTVoiceSink(AudioSinkBase):
         self._running = False
         if self._check_task:
             self._check_task.cancel()
-        self._decoders.clear()
         self.user_buffers.clear()
         self.user_last_spoke.clear()
 
