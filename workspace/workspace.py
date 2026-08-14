@@ -114,6 +114,7 @@ class STTVoiceSink(AudioSinkBase):
         self.user_buffers: Dict[int, bytearray] = {}
         self.user_last_spoke: Dict[int, float] = {}
         self.user_info: Dict[int, Dict[str, Any]] = {}
+        self._decoders: Dict[int, Any] = {}
         self.recognizer = sr.Recognizer()
         self.recognizer.energy_threshold = 150
         self.recognizer.dynamic_energy_threshold = True
@@ -126,10 +127,41 @@ class STTVoiceSink(AudioSinkBase):
             pass
 
     def wants_opus(self) -> bool:
-        return False
+        return True
 
     def write(self, user: Optional[Any], data: Any) -> None:
-        if not self._running or not getattr(data, "pcm", None):
+        if not self._running:
+            return
+
+        uid = getattr(user, "id", None) or (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0) or 0)
+        uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
+
+        # Decode Opus or retrieve PCM with robust error isolation
+        pcm_bytes = getattr(data, "pcm", None)
+        if not pcm_bytes and getattr(data, "opus", None):
+            import discord.opus
+            from ctypes.util import find_library
+            if not discord.opus.is_loaded():
+                lib = find_library("opus")
+                if lib:
+                    discord.opus.load_opus(lib)
+
+            if uid not in self._decoders:
+                try:
+                    self._decoders[uid] = discord.opus.Decoder()
+                except Exception:
+                    return
+
+            try:
+                pcm_bytes = self._decoders[uid].decode(data.opus, fec=False)
+            except Exception:
+                try:
+                    self._decoders[uid] = discord.opus.Decoder()
+                except Exception:
+                    pass
+                return
+
+        if not pcm_bytes:
             return
 
         if self._check_task is None or self._check_task.done():
@@ -140,9 +172,6 @@ class STTVoiceSink(AudioSinkBase):
             except Exception:
                 pass
 
-        uid = getattr(user, "id", None) or (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0) or 0)
-        uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
-
         now = time.time()
         if uid not in self.user_buffers:
             self.user_buffers[uid] = bytearray()
@@ -152,7 +181,7 @@ class STTVoiceSink(AudioSinkBase):
                 "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
             }
 
-        self.user_buffers[uid].extend(data.pcm)
+        self.user_buffers[uid].extend(pcm_bytes)
         self.user_last_spoke[uid] = now
 
     async def _silence_checker(self) -> None:
@@ -213,6 +242,7 @@ class STTVoiceSink(AudioSinkBase):
         self._running = False
         if self._check_task:
             self._check_task.cancel()
+        self._decoders.clear()
         self.user_buffers.clear()
         self.user_last_spoke.clear()
 
