@@ -150,8 +150,8 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
 
 class KasperyaEnergyVad:
     """Frame-by-frame energy VAD with Discord DTX silence-gap flushing."""
-    SPEECH_THRESHOLD = 0.004
-    MIN_SPEECH_CHUNKS = 2
+    SPEECH_THRESHOLD = 0.009
+    MIN_SPEECH_CHUNKS = 3
 
     def __init__(self):
         self.is_speaking = False
@@ -199,11 +199,19 @@ class KasperyaEnergyVad:
         if self.is_speaking and (now - self.last_packet_time >= timeout):
             self.is_speaking = False
             self.speech_frames = 0
-            # Minimum 300ms of speech (16000 * 2 * 0.3 = 9600 bytes)
-            if len(self.buffer) >= 9600:
-                res = bytes(self.buffer)
-                self.buffer.clear()
-                return res
+            try:
+                import audioop
+            except ImportError:
+                import audioop_lts as audioop
+
+            # Validate speech buffer has enough samples and real speech energy
+            # Minimum 400ms of speech (16000 * 2 * 0.4 = 12800 bytes)
+            if len(self.buffer) >= 12800:
+                buf_rms = audioop.rms(self.buffer, 2)
+                if buf_rms >= 300:
+                    res = bytes(self.buffer)
+                    self.buffer.clear()
+                    return res
             self.buffer.clear()
         return b''
 
@@ -344,7 +352,8 @@ class STTVoiceSink(AudioSinkBase):
         provider = cfg.get("provider", "omniroute")
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
-        model = cfg.get("model", "groq/whisper-large-v3")
+        # Always use the full whisper-large-v3 model (matches Kasperya)
+        model = "groq/whisper-large-v3"
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
 
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
