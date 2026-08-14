@@ -2287,20 +2287,23 @@ class DiscordWorkspace(Workspace):
 
         loop = asyncio.get_event_loop()
         def _download():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(target, download=True)
-                if "entries" in info and len(info["entries"]) > 0:
-                    entry = info["entries"][0]
-                else:
-                    entry = info
-                return {
-                    "title": entry.get("title", "Track"),
-                    "uploader": entry.get("uploader", "Unknown"),
-                    "duration": entry.get("duration", 0),
-                    "url": entry.get("webpage_url", query_or_url),
-                    "file_path": f"/tmp/unai_music_{track_id}.mp3",
-                    "cookies_used": bool(ydl_opts.get("cookiefile") or ydl_opts.get("cookiesfrombrowser")),
-                }
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(target, download=True)
+                    if "entries" in info and len(info["entries"]) > 0:
+                        entry = info["entries"][0]
+                    else:
+                        entry = info
+                    return {
+                        "title": entry.get("title", "Track"),
+                        "uploader": entry.get("uploader", "Unknown"),
+                        "duration": entry.get("duration", 0),
+                        "url": entry.get("webpage_url", query_or_url),
+                        "file_path": f"/tmp/unai_music_{track_id}.mp3",
+                        "cookies_used": bool(ydl_opts.get("cookiefile") or ydl_opts.get("cookiesfrombrowser")),
+                    }
 
         track_meta = await loop.run_in_executor(None, _download)
         res = await self.voice_play_file(channel_id=channel_id, file_path=track_meta["file_path"], volume=volume)
