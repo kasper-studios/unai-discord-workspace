@@ -350,10 +350,29 @@ class DiscordWorkspace(Workspace):
         self._platform: str = "desktop"
         self._voice_manager: VoiceManager = VoiceManager()
         self._voice_transcripts_cache: List[Dict[str, Any]] = []
+        self._music_config: Dict[str, Any] = {}
         self._hermes_webhook_url: Optional[str] = None
         self._load_saved_token()
         self._load_notifications_cache()
         self._load_voice_transcripts_cache()
+        self._load_music_config()
+
+    def _load_music_config(self) -> None:
+        mf = _get_data_dir() / "music_config.json"
+        if mf.exists():
+            try:
+                self._music_config = json.loads(mf.read_text())
+            except Exception:
+                self._music_config = {}
+        else:
+            self._music_config = {}
+
+    def _save_music_config(self) -> None:
+        mf = _get_data_dir() / "music_config.json"
+        try:
+            mf.write_text(json.dumps(self._music_config, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
 
     def _trigger_hermes_webhook(self, notif: Dict[str, Any]) -> None:
         if not self._hermes_webhook_url:
@@ -2158,12 +2177,62 @@ class DiscordWorkspace(Workspace):
         ]
 
     @tool(
+        "discord.voice.music_configure",
+        description="Configure cookies and extractor settings for YouTube / yt-dlp music downloader",
+        arguments={
+            "cookie_file_path": {"type": "string", "description": "Absolute path to cookies.txt file (Netscape format)", "default": ""},
+            "browser": {"type": "string", "description": "Browser to extract cookies from ('chrome', 'firefox', 'brave', 'edge', 'chromium', 'vivaldi')", "default": ""},
+            "raw_cookies_content": {"type": "string", "description": "Raw text content of cookies.txt to save automatically to ~/.unai/data/discord/cookies.txt", "default": ""},
+            "clear": {"type": "boolean", "description": "Clear saved music cookies and browser configuration", "default": False}
+        },
+    )
+    async def voice_music_configure(
+        self,
+        cookie_file_path: str = "",
+        browser: str = "",
+        raw_cookies_content: str = "",
+        clear: bool = False,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if clear:
+            self._music_config = {}
+            self._save_music_config()
+            cf = _get_data_dir() / "cookies.txt"
+            if cf.exists():
+                cf.unlink()
+            return {"configured": False, "info": "Music cookie settings cleared."}
+
+        if raw_cookies_content:
+            cf = _get_data_dir() / "cookies.txt"
+            cf.write_text(raw_cookies_content.strip())
+            self._music_config["cookiefile"] = str(cf)
+
+        if cookie_file_path:
+            p = Path(cookie_file_path)
+            if not p.exists():
+                raise RuntimeError(f"Cookie file not found at: {cookie_file_path}")
+            self._music_config["cookiefile"] = str(p.resolve())
+
+        if browser:
+            self._music_config["browser"] = browser.lower().strip()
+
+        self._save_music_config()
+        return {
+            "configured": True,
+            "cookiefile": self._music_config.get("cookiefile"),
+            "browser": self._music_config.get("browser"),
+            "info": "YouTube music cookies configured successfully. yt-dlp will use these settings for audio downloading.",
+        }
+
+    @tool(
         "discord.voice.play_music",
-        description="Search, download (to /tmp), and play music or audio tracks from YouTube or URL directly in a Discord Voice Channel",
+        description="Search, download (to /tmp), and play music or audio tracks from YouTube or URL directly in a Discord Voice Channel (supports custom cookies and browser cookies)",
         arguments={
             "channel_id": {"type": "string", "description": "Target Voice Channel ID or Guild ID"},
             "query_or_url": {"type": "string", "description": "Search query or YouTube/Soundcloud URL to play"},
-            "volume": {"type": "number", "description": "Volume level (0.1 to 2.0)", "default": 1.0}
+            "volume": {"type": "number", "description": "Volume level (0.1 to 2.0)", "default": 1.0},
+            "cookie_file": {"type": "string", "description": "Optional custom cookies.txt path for this playback", "default": ""},
+            "browser": {"type": "string", "description": "Optional browser to read cookies from for this playback", "default": ""}
         },
     )
     async def voice_play_music(
@@ -2171,6 +2240,8 @@ class DiscordWorkspace(Workspace):
         channel_id: str,
         query_or_url: str,
         volume: float = 1.0,
+        cookie_file: str = "",
+        browser: str = "",
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         import yt_dlp
@@ -2182,18 +2253,40 @@ class DiscordWorkspace(Workspace):
 
         track_id = str(uuid.uuid4())[:8]
         out_tmpl = f"/tmp/unai_music_{track_id}.%(ext)s"
-        ydl_opts = {
+        ydl_opts: Dict[str, Any] = {
             "format": "bestaudio/best",
             "outtmpl": out_tmpl,
             "quiet": True,
             "no_warnings": True,
             "max_filesize": 100 * 1024 * 1024,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web", "mweb"]
+                }
+            },
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
         }
+
+        # Resolve cookies: 1) direct param -> 2) music_config.json -> 3) auto-detect in ~/.unai/data/discord/
+        active_cookie_file = cookie_file or self._music_config.get("cookiefile")
+        if not active_cookie_file:
+            for cand in ["cookies.txt", "youtube_cookies.txt", "yt_cookies.txt"]:
+                cand_path = _get_data_dir() / cand
+                if cand_path.exists():
+                    active_cookie_file = str(cand_path)
+                    break
+
+        if active_cookie_file and Path(active_cookie_file).exists():
+            ydl_opts["cookiefile"] = active_cookie_file
+
+        active_browser = browser or self._music_config.get("browser")
+        if active_browser and not active_cookie_file:
+            ydl_opts["cookiesfrombrowser"] = (active_browser,)
+
         target = query_or_url if query_or_url.startswith("http") else f"ytsearch1:{query_or_url}"
 
         loop = asyncio.get_event_loop()
@@ -2210,6 +2303,7 @@ class DiscordWorkspace(Workspace):
                     "duration": entry.get("duration", 0),
                     "url": entry.get("webpage_url", query_or_url),
                     "file_path": f"/tmp/unai_music_{track_id}.mp3",
+                    "cookies_used": bool(ydl_opts.get("cookiefile") or ydl_opts.get("cookiesfrombrowser")),
                 }
 
         track_meta = await loop.run_in_executor(None, _download)
