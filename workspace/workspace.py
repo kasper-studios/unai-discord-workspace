@@ -804,34 +804,78 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.channels.list",
-        description="List text/voice channels of a server (guild) or list DM channels if guild_id is omitted",
+        description="List text/voice channels of a specific server (guild) by guild_id, or list all accessible channels across all servers and DMs if guild_id is omitted",
         arguments={
-            "guild_id": {"type": "string", "description": "Server (guild) ID. If omitted, returns active DM channels.", "default": ""}
+            "guild_id": {"type": "string", "description": "Optional server (guild) ID. If omitted, returns channels from all joined servers and open DMs.", "default": ""}
         },
     )
     async def channels_list(self, guild_id: str = "", reason: Optional[str] = None) -> List[Dict[str, Any]]:
-        if guild_id:
-            channels = await self._api_request("GET", f"/guilds/{guild_id}/channels")
-        else:
-            channels = await self._api_request("GET", "/users/@me/channels")
-
         type_map = {0: "text", 1: "dm", 2: "voice", 3: "group_dm", 4: "category", 5: "news", 11: "public_thread", 12: "private_thread"}
         out = []
-        for c in channels:
-            ctype = type_map.get(c.get("type"), str(c.get("type")))
-            recipients = []
-            if "recipients" in c:
-                for r in c["recipients"]:
-                    recipients.append({"id": r.get("id"), "username": r.get("username"), "global_name": r.get("global_name")})
-            out.append({
-                "id": c.get("id"),
-                "name": c.get("name") or (", ".join(r["username"] for r in recipients) if recipients else "DM"),
-                "type": ctype,
-                "position": c.get("position"),
-                "parent_id": c.get("parent_id"),
-                "topic": c.get("topic"),
-                "recipients": recipients if recipients else None,
-            })
+
+        if guild_id:
+            channels = await self._api_request("GET", f"/guilds/{guild_id}/channels")
+            for c in channels:
+                ctype = type_map.get(c.get("type"), str(c.get("type")))
+                out.append({
+                    "id": c.get("id"),
+                    "name": c.get("name", "channel"),
+                    "type": ctype,
+                    "guild_id": guild_id,
+                    "position": c.get("position"),
+                    "parent_id": c.get("parent_id"),
+                    "topic": c.get("topic"),
+                })
+            return out
+
+        # If guild_id is omitted, check DMs first
+        try:
+            dms = await self._api_request("GET", "/users/@me/channels")
+            for c in dms:
+                ctype = type_map.get(c.get("type"), str(c.get("type")))
+                recipients = []
+                if "recipients" in c:
+                    for r in c["recipients"]:
+                        recipients.append({"id": r.get("id"), "username": r.get("username"), "global_name": r.get("global_name")})
+                out.append({
+                    "id": c.get("id"),
+                    "name": c.get("name") or (", ".join(r["username"] for r in recipients) if recipients else "DM"),
+                    "type": ctype,
+                    "guild_id": None,
+                    "guild_name": "Direct Messages",
+                    "position": c.get("position"),
+                    "parent_id": c.get("parent_id"),
+                    "topic": c.get("topic"),
+                    "recipients": recipients if recipients else None,
+                })
+        except Exception:
+            pass
+
+        # Then fetch all joined servers and their channels
+        try:
+            guilds = await self._api_request("GET", "/users/@me/guilds")
+            for g in guilds:
+                gid = g.get("id")
+                gname = g.get("name", "Server")
+                try:
+                    g_channels = await self._api_request("GET", f"/guilds/{gid}/channels")
+                    for c in g_channels:
+                        ctype = type_map.get(c.get("type"), str(c.get("type")))
+                        out.append({
+                            "id": c.get("id"),
+                            "name": c.get("name", "channel"),
+                            "type": ctype,
+                            "guild_id": gid,
+                            "guild_name": gname,
+                            "position": c.get("position"),
+                            "parent_id": c.get("parent_id"),
+                            "topic": c.get("topic"),
+                        })
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         return out
 
     @tool(
