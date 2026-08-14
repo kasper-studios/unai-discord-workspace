@@ -174,8 +174,8 @@ class KasperyaEnergyVad:
         self.last_packet_time = now
         self.total_frames += 1
 
-        # 1. Convert 48k stereo -> 48k mono with 0.5/0.5 weights to prevent 2x clipping
-        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 0.5, 0.5)
+        # 1. Extract clean Left channel (1.0, 0.0) to avoid any phase cancellation between stereo mic channels
+        mono_48k = audioop.tomono(pcm_48k_stereo, 2, 1.0, 0.0)
 
         rms = audioop.rms(mono_48k, 2)
         peak = audioop.max(mono_48k, 2)
@@ -220,12 +220,12 @@ class KasperyaEnergyVad:
 
         return self.check_flush(now)
 
-    def check_flush(self, now: float, timeout: float = 0.5) -> Optional[bytes]:
+    def check_flush(self, now: float, timeout: float = 0.7) -> Optional[bytes]:
         if not self.is_speaking:
             return None
 
-        # End phrase if: 12 silence packets (240ms) arrived OR timeout passed since last speech frame
-        phrase_ended = (self.silence_frames >= 12) or (now - self.last_speech_time >= timeout)
+        # End phrase if: 25 silence packets (500ms) arrived OR timeout (700ms) passed since last speech frame
+        phrase_ended = (self.silence_frames >= 25) or (now - self.last_speech_time >= timeout)
         if not phrase_ended:
             return None
 
@@ -237,8 +237,8 @@ class KasperyaEnergyVad:
         except ImportError:
             import audioop_lts as audioop
 
-        # Validate speech buffer: minimum 250ms at 48kHz mono (48000 * 2 * 0.25 = 24000 bytes)
-        if len(self.buffer) >= 24000:
+        # Validate speech buffer: minimum 500ms at 48kHz mono (48000 * 2 * 0.5 = 48000 bytes)
+        if len(self.buffer) >= 48000:
             buf_rms = audioop.rms(self.buffer, 2)
             buf_peak = audioop.max(self.buffer, 2)
             buf_dur = len(self.buffer) / (48000 * 2)
@@ -247,7 +247,7 @@ class KasperyaEnergyVad:
                 raw_48k = bytes(self.buffer)
                 self.buffer.clear()
 
-                # Pure in-memory 48kHz mono WAV (Whisper natively supports 48kHz)
+                # Pure in-memory 48kHz mono WAV
                 wav_io = io.BytesIO()
                 with wave.open(wav_io, 'wb') as wf:
                     wf.setnchannels(1)
@@ -270,7 +270,7 @@ class KasperyaEnergyVad:
 class STTVoiceSink(AudioSinkBase):
     """Real-time Voice Receiver and Speech-to-Text Sink using Kasperya Energy VAD."""
 
-    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.5, stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
+    def __init__(self, callback: Any, language: str = "ru-RU", silence_threshold_seconds: float = 0.7, stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
         super().__init__()
         self.callback = callback
         self.language = language
@@ -377,15 +377,18 @@ class STTVoiceSink(AudioSinkBase):
     def _is_whisper_hallucination(self, text: str) -> bool:
         """Filter out common Whisper hallucinations generated on silence or low noise."""
         cleaned = text.lower().strip().rstrip(".!?,")
-        if cleaned in ["конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд"]:
+        if not cleaned:
+            return True
+        if (cleaned.startswith("[") and cleaned.endswith("]")) or (cleaned.startswith("(") and cleaned.endswith(")")):
+            return True
+        if cleaned in ["конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд", "звучит музыка", "музыка", "аплодисменты", "тишина"]:
             return True
         hallucinations = [
             "продолжение следует",
-            "субтитры сделал",
-            "субтитры добавил",
-            "редактор субтитров",
+            "субтитры",
+            "редактор",
             "корректор",
-            "перевод и субтитры",
+            "перевод",
             "спасибо за просмотр",
             "подписывайтесь",
             "ставьте лайк",
@@ -396,7 +399,10 @@ class STTVoiceSink(AudioSinkBase):
             "диматорзок",
             "semkin",
             "семкин",
+            "звучит музыка",
             "благодарю за внимание",
+            "сообществом",
+            "читайте на",
         ]
         return any(h in cleaned for h in hallucinations)
 
