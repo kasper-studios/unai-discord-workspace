@@ -261,17 +261,17 @@ class UserVoiceBuffer:
         else:
             self.silence_frame_count += 1
 
-        # End of phrase condition 1: ~600ms (30 frames) of silence
-        if self.silence_frame_count >= 30:
+        # End of phrase condition 1: ~500ms (25 frames) of silence
+        if self.silence_frame_count >= 25:
             return self._flush_phrase()
 
-        # End of phrase condition 2: max phrase duration ~15s (750 frames)
-        if len(self.phrase_frames) >= 750:
+        # End of phrase condition 2: max phrase duration ~7s (350 frames)
+        if len(self.phrase_frames) >= 350:
             return self._flush_phrase()
 
         return None
 
-    def flush_if_timed_out(self, now: float, timeout: float = 0.70) -> Optional[Tuple[bytes, float, float]]:
+    def flush_if_timed_out(self, now: float, timeout: float = 0.55) -> Optional[Tuple[bytes, float, float]]:
         """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
         if self.is_speaking and (now - self.last_packet_time >= timeout):
             return self._flush_phrase()
@@ -299,8 +299,8 @@ class UserVoiceBuffer:
         avg_rms = voiced_rms / max(1, voiced_cnt)
         voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Validation: phrase must be >= 1.0s, have >= 22 voiced frames (~440ms), voiced ratio >= 35%, and avg RMS >= 750
-        if duration_sec < 1.0 or voiced_cnt < 22 or voiced_ratio < 0.35 or avg_rms < 750:
+        # Validation: phrase must be >= 0.8s, have >= 18 voiced frames (~360ms), voiced ratio >= 30%, and avg RMS >= 700
+        if duration_sec < 0.8 or voiced_cnt < 18 or voiced_ratio < 0.30 or avg_rms < 700:
             return None
 
         raw_pcm = b"".join(frames)
@@ -505,9 +505,6 @@ class STTVoiceSink(AudioSinkBase):
         if "groq/whisper-large-v3-turbo" not in models_to_try:
             models_to_try.append("groq/whisper-large-v3-turbo")
 
-        # Priming prompt primes Whisper into dialogue mode, suppressing subtitle dataset tokens
-        priming_prompt = "Привет! Как твои дела? Давай поговорим." if "ru" in lang else "Hello! How are you doing? Let's talk."
-
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
             for model in models_to_try:
                 try:
@@ -515,7 +512,6 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                     form.add_field("model", model)
                     form.add_field("language", lang)
-                    form.add_field("prompt", priming_prompt)
                     form.add_field("temperature", "0")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
