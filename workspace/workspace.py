@@ -130,24 +130,7 @@ except Exception:
 
 
 def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
-    """Convert raw 48000Hz 16-bit stereo PCM from Discord to clean 16kHz mono WAV using ffmpeg filter."""
-    try:
-        proc = subprocess.Popen(
-            [
-                "ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
-                "-af", "highpass=f=80,lowpass=f=7500,speechnorm=e=4:r=0.0001:l=1,apad=pad_dur=0.25", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-        wav_bytes, _ = proc.communicate(raw_pcm, timeout=5)
-        if wav_bytes and len(wav_bytes) > 44:
-            return wav_bytes
-    except Exception:
-        pass
-
-    # Fallback to audioop
+    """Convert raw 48000Hz 16-bit stereo PCM from Discord to clean 16kHz mono WAV."""
     try:
         mono_48k = audioop.tomono(raw_pcm, 2, 0.5, 0.5)
         mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
@@ -178,7 +161,7 @@ class UserVoiceBuffer:
     isolated noise clicks, and flushes valid speech phrases on pauses.
     """
 
-    def __init__(self, uid: int, uname: str, energy_threshold: int = 400):
+    def __init__(self, uid: int, uname: str, energy_threshold: int = 450):
         self.uid = uid
         self.uname = uname
         self.energy_threshold = energy_threshold  # RMS threshold for voiced frame
@@ -263,11 +246,13 @@ class UserVoiceBuffer:
         if not frames:
             return None
 
-        duration_sec = len(frames) * 0.02
+        total_frames = len(frames)
+        duration_sec = total_frames * 0.02
         avg_rms = voiced_rms / max(1, voiced_cnt)
+        voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Validation: phrase must be >= 0.6s, have at least 12 voiced frames (~240ms), and avg RMS >= 350
-        if duration_sec < 0.6 or voiced_cnt < 12 or avg_rms < 350:
+        # Validation: phrase must be >= 0.8s, have >= 18 voiced frames (~360ms), voiced ratio >= 30%, and avg RMS >= 450
+        if duration_sec < 0.8 or voiced_cnt < 18 or voiced_ratio < 0.30 or avg_rms < 450:
             return None
 
         raw_pcm = b"".join(frames)
@@ -377,12 +362,13 @@ class STTVoiceSink(AudioSinkBase):
         if (lower.startswith("[") and lower.endswith("]")) or (lower.startswith("(") and lower.endswith(")")) or (lower.startswith("*") and lower.endswith("*")):
             return True
 
-        # Exact match short hallucinations
+        # Exact match short hallucinations and prompt echoes
         exact_list = {
             "конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд",
             "звучит музыка", "музыка", "аплодисменты", "тишина", "звук", "топ 5", "топ-5", "топ 10", "топ-10",
             "а-а-а", "ааа", "о-о-о", "ооо", "продолжение следует", "субтитры", "dimatorzok", "диматорзок",
             "semkin", "семкин", "пауза", "шум", "клики", "перевод", "редактор", "корректор",
+            "голосовой чат", "голосовой чатеринка", "голос", "чат", "писк", "звонок", "discord",
         }
         if lower in exact_list:
             return True
@@ -422,6 +408,7 @@ class STTVoiceSink(AudioSinkBase):
             r"режиссер",
             r"vk\.com",
             r"youtube\.com",
+            r"голосовой чат",
         ]
         for pat in sub_patterns:
             if re.search(pat, lower):
@@ -470,8 +457,6 @@ class STTVoiceSink(AudioSinkBase):
         if "groq/whisper-large-v3-turbo" not in models_to_try:
             models_to_try.append("groq/whisper-large-v3-turbo")
 
-        prompt_text = "Голосовой чат Discord, живой разговор, реплики пользователей без титров и субтитров."
-
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
             for model in models_to_try:
                 try:
@@ -479,7 +464,6 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                     form.add_field("model", model)
                     form.add_field("language", lang)
-                    form.add_field("prompt", prompt_text)
                     form.add_field("temperature", "0")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
