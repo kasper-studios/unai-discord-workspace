@@ -183,7 +183,9 @@ class STTVoiceSink(AudioSinkBase):
         if not self._running:
             return
 
-        uid = getattr(user, "id", None) or (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0) or 0)
+        ssrc = (getattr(data, "packet", None) and getattr(data.packet, "ssrc", 0)) or 0
+        user_id = getattr(user, "id", None)
+        uid = user_id or ssrc or 0
         uname = getattr(user, "display_name", None) or getattr(user, "name", None) or "Speaker"
 
         # Receive decoded PCM directly from jitter buffer
@@ -213,13 +215,22 @@ class STTVoiceSink(AudioSinkBase):
             except Exception:
                 pass
 
+        # Merge early SSRC buffer into identified user_id buffer
+        if ssrc and user_id and ssrc != user_id and ssrc in self.user_buffers:
+            early_bytes = self.user_buffers.pop(ssrc, bytearray())
+            if user_id not in self.user_buffers:
+                self.user_buffers[user_id] = bytearray()
+            self.user_buffers[user_id].extend(early_bytes)
+            self.user_last_spoke.pop(ssrc, None)
+
         if uid not in self.user_buffers:
             self.user_buffers[uid] = bytearray()
-            self.user_info[uid] = {
-                "id": str(uid),
-                "username": uname,
-                "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
-            }
+
+        self.user_info[uid] = {
+            "id": str(user_id or uid),
+            "username": uname,
+            "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
+        }
 
         self.user_buffers[uid].extend(pcm_bytes)
         self.user_last_spoke[uid] = now
