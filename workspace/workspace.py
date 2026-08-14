@@ -84,17 +84,28 @@ try:
             pcm_ptr = ctypes.cast(pcm, discord.opus.c_int16_ptr)
 
             if not data:
-                ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
-                if ret < 0:
-                    return b'\x00' * 3840
-                return array.array('h', pcm[: ret * channel_count]).tobytes()
-
-            ret = discord.opus._lib.opus_decode(self._state, data, len(data), pcm_ptr, max_frame_size, 1 if fec else 0)
-            if ret < 0:
-                ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
-            if ret < 0:
+                try:
+                    ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
+                    if ret > 0:
+                        return array.array('h', pcm[: ret * channel_count]).tobytes()
+                except Exception:
+                    pass
                 return b'\x00' * 3840
-            return array.array('h', pcm[: ret * channel_count]).tobytes()
+
+            try:
+                ret = discord.opus._lib.opus_decode(self._state, data, len(data), pcm_ptr, max_frame_size, 1 if fec else 0)
+                if ret > 0:
+                    return array.array('h', pcm[: ret * channel_count]).tobytes()
+            except Exception:
+                pass
+
+            try:
+                ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
+                if ret > 0:
+                    return array.array('h', pcm[: ret * channel_count]).tobytes()
+            except Exception:
+                pass
+            return b'\x00' * 3840
 
         discord.opus.Decoder.decode = _safe_opus_decode
 except Exception:
