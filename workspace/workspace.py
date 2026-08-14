@@ -157,6 +157,7 @@ class KasperyaEnergyVad:
         self.username = username
         self.is_speaking = False
         self.speech_frames = 0
+        self.total_frames = 0
         self.last_packet_time = 0.0
         self.pre_roll = []
         self.buffer = bytearray()
@@ -169,11 +170,13 @@ class KasperyaEnergyVad:
 
         now = time.time()
         self.last_packet_time = now
+        self.total_frames += 1
 
         # 1. Convert 48k stereo -> 48k mono with 0.5/0.5 weights to prevent 2x clipping
         mono_48k = audioop.tomono(pcm_48k_stereo, 2, 0.5, 0.5)
 
         rms = audioop.rms(mono_48k, 2)
+        peak = audioop.max(mono_48k, 2)
         energy = rms / 32768.0
 
         if energy > self.SPEECH_THRESHOLD:
@@ -186,7 +189,7 @@ class KasperyaEnergyVad:
                 try:
                     dbg_log = _get_data_dir() / "voice_debug.log"
                     with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] VAD speech started for {self.username} (energy={energy:.4f}, rms={rms})\n")
+                        f.write(f"[{datetime.now()}] 🎙️ [VAD START] {self.username} started speaking | RMS: {rms} | Peak: {peak} | Energy: {energy:.4f}\n")
                 except Exception:
                     pass
         else:
@@ -198,6 +201,16 @@ class KasperyaEnergyVad:
             self.pre_roll.append(mono_48k)
             if len(self.pre_roll) > 5:
                 self.pre_roll.pop(0)
+
+        # Log periodic audio characteristics every 25 frames (~0.5s)
+        if self.total_frames % 25 == 1:
+            try:
+                dbg_log = _get_data_dir() / "voice_debug.log"
+                status = f"SPEAKING (buf={len(self.buffer)/(48000*2):.1f}s)" if self.is_speaking else "IDLE"
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] 📊 [AUDIO {self.username}] RMS: {rms:<4} | Peak: {peak:<5} | Energy: {energy:.4f} | State: {status}\n")
+            except Exception:
+                pass
 
     def check_flush(self, now: float, timeout: float = 0.7) -> bytes:
         if self.is_speaking and (now - self.last_packet_time >= timeout):
@@ -211,6 +224,9 @@ class KasperyaEnergyVad:
             # Validate speech buffer: minimum 300ms at 48kHz mono (48000 * 2 * 0.3 = 28800 bytes)
             if len(self.buffer) >= 28800:
                 buf_rms = audioop.rms(self.buffer, 2)
+                buf_peak = audioop.max(self.buffer, 2)
+                buf_dur = len(self.buffer) / (48000 * 2)
+
                 if buf_rms >= 100:
                     raw_48k = bytes(self.buffer)
                     self.buffer.clear()
@@ -225,7 +241,7 @@ class KasperyaEnergyVad:
                             try:
                                 dbg_log = _get_data_dir() / "voice_debug.log"
                                 with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] VAD speech ended for {self.username} (len={len(raw_48k)} bytes, rms={buf_rms})\n")
+                                    f.write(f"[{datetime.now()}] ⏹️ [VAD END] {self.username} phrase finished | Dur: {buf_dur:.2f}s | Avg RMS: {buf_rms} | Max Peak: {buf_peak}\n")
                             except Exception:
                                 pass
                             return wav_out
@@ -288,14 +304,6 @@ class STTVoiceSink(AudioSinkBase):
         self.bytes_received += len(pcm_bytes)
         self.last_packet_time = now
         self.speakers.add(uname)
-
-        if self.packets_received % 50 == 1:
-            try:
-                dbg_log = _get_data_dir() / "voice_debug.log"
-                with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] STTVoiceSink received packet #{self.packets_received} from {uname} (pcm: {len(pcm_bytes)} bytes)\n")
-            except Exception:
-                pass
 
         if ssrc and user_id and ssrc != user_id and ssrc in self.user_vads:
             old_vad = self.user_vads.pop(ssrc)
