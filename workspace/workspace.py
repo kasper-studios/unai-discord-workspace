@@ -129,6 +129,37 @@ except Exception:
         pass
 
 
+def _clean_transcript_text(text: str) -> str:
+    """Normalize transcript casing and deduplicate Whisper repetition loops."""
+    if not text or not text.strip():
+        return ""
+    t = text.strip()
+
+    # 1. Deduplicate repetitive sentence/clause patterns (e.g. 'А, да. А, да. А, да.' -> 'А, да.')
+    for _ in range(3):
+        m = re.match(r'^(.{2,30}?[.!?,\s])(?:\s*\1){2,}', t, re.IGNORECASE)
+        if m:
+            t = m.group(1).strip()
+            break
+        words = t.split()
+        if len(words) >= 4 and len(set(w.lower().rstrip('.!?') for w in words)) == 1:
+            t = words[0].rstrip('.!?') + '.'
+            break
+
+    # 2. Normalize ALL CAPS shouting (e.g. 'КАК ТОПИТ?' -> 'Как топит?')
+    letters = [c for c in t if c.isalpha()]
+    if len(letters) >= 4 and sum(1 for c in letters if c.isupper()) / len(letters) >= 0.8:
+        sentences = [s.strip() for s in re.split(r'([.!?]+)', t) if s.strip()]
+        rebuilt = []
+        for i in range(0, len(sentences), 2):
+            s = sentences[i].lower().capitalize()
+            punc = sentences[i+1] if i+1 < len(sentences) else ''
+            rebuilt.append(s + punc)
+        t = " ".join(rebuilt)
+
+    return t.strip()
+
+
 def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
     """Convert raw 48000Hz 16-bit stereo PCM from Discord to clean, normalized 16kHz mono WAV."""
     try:
@@ -142,11 +173,11 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
         except Exception:
             pass
 
-        # RMS volume normalization (boost low-volume speech to healthy target RMS ~9000)
+        # RMS volume normalization (target healthy speech level ~4800 RMS, avoids distortion & shouting)
         try:
             cur_rms = audioop.rms(mono_16k, 2)
             if cur_rms > 0:
-                factor = min(4.0, max(0.5, 9000.0 / cur_rms))
+                factor = min(3.0, max(0.4, 4800.0 / cur_rms))
                 mono_16k = audioop.mul(mono_16k, 2, factor)
         except Exception:
             pass
@@ -492,8 +523,8 @@ class STTVoiceSink(AudioSinkBase):
                         async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                candidate = data.get("text", "").strip()
-                                if not self._is_whisper_hallucination(candidate):
+                                candidate = _clean_transcript_text(data.get("text", ""))
+                                if candidate and not self._is_whisper_hallucination(candidate):
                                     text = candidate
                                     with open(dbg_log, "a") as f:
                                         f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Whisper ({model}) for {username}: '{text}'\n")
@@ -519,6 +550,8 @@ class STTVoiceSink(AudioSinkBase):
 
             loop = asyncio.get_event_loop()
             candidate = await loop.run_in_executor(None, _google_transcribe)
+            if candidate:
+                candidate = _clean_transcript_text(candidate)
             if candidate and not self._is_whisper_hallucination(candidate):
                 text = candidate
                 with open(dbg_log, "a") as f:
