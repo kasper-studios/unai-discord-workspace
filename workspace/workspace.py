@@ -209,8 +209,8 @@ class STTVoiceSink(AudioSinkBase):
                 "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
             }
             r = sr.Recognizer()
-            r.energy_threshold = 150
-            r.dynamic_energy_threshold = True
+            r.energy_threshold = 400
+            r.dynamic_energy_threshold = False
             r.pause_threshold = 0.8
             self.user_recognizers[uid] = r
 
@@ -232,7 +232,31 @@ class STTVoiceSink(AudioSinkBase):
             if not self._running:
                 return
             try:
+                raw = audio.get_raw_data()
+                if not raw:
+                    return
+
+                duration_sec = len(raw) / (audio.sample_rate * audio.sample_width)
+                if duration_sec < 0.4:
+                    return
+
+                # Calculate RMS
+                try:
+                    try:
+                        import audioop
+                    except ImportError:
+                        import audioop_lts as audioop
+                    rms = audioop.rms(raw, audio.sample_width)
+                except Exception:
+                    rms = 500
+
+                if rms < 250:
+                    return
+
                 wav_bytes = audio.get_wav_data(convert_rate=16000, convert_width=2)
+                if len(wav_bytes) < 1000:
+                    return
+
                 uinfo = self.user_info.get(uid, {"id": str(uid), "username": "Speaker"})
                 try:
                     with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
@@ -247,7 +271,7 @@ class STTVoiceSink(AudioSinkBase):
                     else:
                         asyncio.run(self._process_stt_wav(uid, uinfo, wav_bytes))
                 except Exception:
-                    asyncio.run(self._process_stt_wav(uid, uinfo, wav_bytes))
+                    pass
             except Exception as e:
                 dbg_log = _get_data_dir() / "voice_debug.log"
                 with open(dbg_log, "a") as f:
