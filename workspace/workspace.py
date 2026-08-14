@@ -9,16 +9,24 @@ Follows ADR-0004 for one-shot login tool state management.
 
 import asyncio
 import base64
+import collections
 from datetime import datetime
 import io
 import json
 import os
 from pathlib import Path
+import re
+import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 import wave
 import aiohttp
 import speech_recognition as sr
+
+try:
+    import audioop
+except ImportError:
+    import audioop_lts as audioop
 
 from unai.sdk import Workspace, tool
 
@@ -127,15 +135,29 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:0",
-                "-af", "highpass=f=80,lowpass=f=8000,speechnorm=e=4:r=0.0001:l=1,adelay=200|200,apad=pad_dur=0.3", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"
+                "-af", "highpass=f=80,lowpass=f=7500,speechnorm=e=4:r=0.0001:l=1,apad=pad_dur=0.25", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"
             ],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        wav_bytes, _ = proc.communicate(raw_pcm)
+        wav_bytes, _ = proc.communicate(raw_pcm, timeout=5)
         if wav_bytes and len(wav_bytes) > 44:
             return wav_bytes
+    except Exception:
+        pass
+
+    # Fallback to audioop
+    try:
+        mono_48k = audioop.tomono(raw_pcm, 2, 0.5, 0.5)
+        mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(mono_16k)
+        return wav_io.getvalue()
     except Exception:
         pass
 
@@ -148,58 +170,112 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
     return wav_io.getvalue()
 
 
-class DiscordSRAudioSource(sr.AudioSource):
-    """AudioSource stream adaptor that reads incoming Discord PCM buffers for SpeechRecognition."""
-    little_endian = True
-    SAMPLE_RATE = 48000
-    SAMPLE_WIDTH = 2
-    CHANNELS = 2
-    CHUNK = 960
+class UserVoiceBuffer:
+    """Per-speaker Discrete Voice Activity Detector (VAD) & Phrase Accumulator.
+    
+    Processes incoming 20ms 48kHz stereo frames without blocking.
+    Maintains pre-speech history so words aren't clipped, filters out
+    isolated noise clicks, and flushes valid speech phrases on pauses.
+    """
 
-    def __init__(self, buffer: array.array):
-        self.buffer = buffer
-        self._entered = False
+    def __init__(self, uid: int, uname: str, energy_threshold: int = 400):
+        self.uid = uid
+        self.uname = uname
+        self.energy_threshold = energy_threshold  # RMS threshold for voiced frame
+        self.pre_buffer: collections.deque = collections.deque(maxlen=15)  # ~300ms pre-speech ring buffer
+        self.phrase_frames: List[bytes] = []
+        self.is_speaking: bool = False
+        self.consecutive_voice_frames: int = 0
+        self.silence_frame_count: int = 0
+        self.voiced_frame_count: int = 0
+        self.voiced_rms_sum: float = 0.0
+        self.last_packet_time: float = time.time()
+        self.phrase_start_time: float = 0.0
 
-    @property
-    def stream(self):
-        return self
+    def process_frame(self, pcm_bytes: bytes) -> Optional[Tuple[bytes, float, float]]:
+        """Process incoming 20ms frame. Returns (raw_pcm, duration_sec, avg_rms) if a valid phrase was completed, else None."""
+        now = time.time()
+        self.last_packet_time = now
 
-    def __enter__(self):
-        self._entered = True
-        return self
-
-    def __exit__(self, *exc):
-        self._entered = False
-
-    def read(self, size: int) -> bytes:
         try:
-            import audioop
-        except ImportError:
-            import audioop_lts as audioop
+            frame_rms = audioop.rms(pcm_bytes, 2)
+        except Exception:
+            frame_rms = 0
 
-        # Wait briefly for incoming Discord UDP packets
-        for _ in range(5):
-            if len(self.buffer) < size * self.CHANNELS:
-                time.sleep(0.02)
+        is_voice = frame_rms >= self.energy_threshold
+
+        if not self.is_speaking:
+            if is_voice:
+                self.consecutive_voice_frames += 1
+                # Require 3 consecutive voice frames (~60ms) to trigger speech start, avoiding micro-pops
+                if self.consecutive_voice_frames >= 3:
+                    self.is_speaking = True
+                    self.phrase_start_time = now
+                    self.phrase_frames = list(self.pre_buffer) + [pcm_bytes]
+                    self.pre_buffer.clear()
+                    self.silence_frame_count = 0
+                    self.voiced_frame_count = self.consecutive_voice_frames
+                    self.voiced_rms_sum = sum(audioop.rms(f, 2) for f in self.phrase_frames if audioop.rms(f, 2) >= self.energy_threshold)
             else:
-                break
+                self.consecutive_voice_frames = 0
+                self.pre_buffer.append(pcm_bytes)
+            return None
 
-        # If Discord paused packets (DTX), stream continuous silence PCM instead of EOF b''
-        if len(self.buffer) < size * self.CHANNELS:
-            return b'\x00' * (size * 2)
+        # Already speaking
+        self.phrase_frames.append(pcm_bytes)
+        if is_voice:
+            self.voiced_frame_count += 1
+            self.voiced_rms_sum += frame_rms
+            self.silence_frame_count = 0
+        else:
+            self.silence_frame_count += 1
 
-        chunksize = size * self.CHANNELS
-        audiochunk = self.buffer[:chunksize].tobytes()
-        del self.buffer[: min(chunksize, len(audiochunk))]
-        # Downmix 48k stereo to 48k mono
-        return audioop.tomono(audiochunk, 2, 0.5, 0.5)
+        # End of phrase condition 1: ~700ms (35 frames) of silence
+        if self.silence_frame_count >= 35:
+            return self._flush_phrase()
 
-    def close(self):
-        del self.buffer[:]
+        # End of phrase condition 2: max phrase duration ~15s (750 frames)
+        if len(self.phrase_frames) >= 750:
+            return self._flush_phrase()
+
+        return None
+
+    def flush_if_timed_out(self, now: float, timeout: float = 0.75) -> Optional[Tuple[bytes, float, float]]:
+        """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
+        if self.is_speaking and (now - self.last_packet_time >= timeout):
+            return self._flush_phrase()
+        return None
+
+    def _flush_phrase(self) -> Optional[Tuple[bytes, float, float]]:
+        """Finalize current speech phrase and validate before dispatching."""
+        frames = self.phrase_frames
+        voiced_cnt = self.voiced_frame_count
+        voiced_rms = self.voiced_rms_sum
+
+        # Reset state
+        self.is_speaking = False
+        self.consecutive_voice_frames = 0
+        self.silence_frame_count = 0
+        self.voiced_frame_count = 0
+        self.voiced_rms_sum = 0.0
+        self.phrase_frames = []
+
+        if not frames:
+            return None
+
+        duration_sec = len(frames) * 0.02
+        avg_rms = voiced_rms / max(1, voiced_cnt)
+
+        # Validation: phrase must be >= 0.6s, have at least 12 voiced frames (~240ms), and avg RMS >= 350
+        if duration_sec < 0.6 or voiced_cnt < 12 or avg_rms < 350:
+            return None
+
+        raw_pcm = b"".join(frames)
+        return (raw_pcm, duration_sec, avg_rms)
 
 
 class STTVoiceSink(AudioSinkBase):
-    """Real-time Voice Receiver and Speech-to-Text Sink using dynamic SpeechRecognition."""
+    """Real-time Voice Receiver and Speech-to-Text Sink using discrete Packet VAD."""
 
     def __init__(self, callback: Any, language: str = "ru-RU", stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
         super().__init__()
@@ -214,16 +290,18 @@ class STTVoiceSink(AudioSinkBase):
             except RuntimeError:
                 self.loop = None
 
-        self._stoppers: Dict[int, Any] = {}
-        self._buffers: Dict[int, array.array] = {}
-        self._recognizers: Dict[int, sr.Recognizer] = {}
+        self._user_buffers: Dict[int, UserVoiceBuffer] = {}
+        self._inactivity_task: Optional[asyncio.Task] = None
         self.user_info: Dict[int, Dict[str, Any]] = {}
         self.packets_received: int = 0
         self.bytes_received: int = 0
         self.transcripts_count: int = 0
         self.last_packet_time: float = 0.0
-        self.speakers: set = set()
+        self.speakers: Set[str] = set()
         self._running = True
+
+        if self.loop and self.loop.is_running():
+            self._inactivity_task = self.loop.create_task(self._inactivity_loop())
 
     def wants_opus(self) -> bool:
         return False
@@ -247,92 +325,134 @@ class STTVoiceSink(AudioSinkBase):
         self.last_packet_time = now
         self.speakers.add(uname)
 
-        self.user_info[uid] = {
+        uinfo = {
             "id": str(user_id or uid),
             "username": uname,
             "avatar": getattr(user, "display_avatar", None) and str(user.display_avatar.url),
         }
+        self.user_info[uid] = uinfo
 
-        if uid not in self._buffers:
-            buf = array.array('B')
-            self._buffers[uid] = buf
-            rec = sr.Recognizer()
-            rec.energy_threshold = 300
-            rec.pause_threshold = 0.8
-            rec.phrase_threshold = 0.3
-            rec.non_speaking_duration = 0.5
-            rec.dynamic_energy_threshold = True
-            self._recognizers[uid] = rec
+        # Lazy-init inactivity loop if loop wasn't ready at init
+        if self._inactivity_task is None and self.loop and self.loop.is_running() and self._running:
+            self._inactivity_task = self.loop.create_task(self._inactivity_loop())
 
-            def _on_phrase_audio(_rec: sr.Recognizer, audio_data: sr.AudioData):
-                if not self._running:
-                    return
-                try:
-                    # Filter out empty or sub-second clicks (require at least 500ms of 16kHz audio: 16000 * 2 * 0.5 = 16000 bytes)
-                    raw_frames = audio_data.get_raw_data(convert_rate=16000, convert_width=2)
-                    if len(raw_frames) < 16000:
-                        return
+        if uid not in self._user_buffers:
+            self._user_buffers[uid] = UserVoiceBuffer(uid=uid, uname=uname)
 
-                    wav_16k = audio_data.get_wav_data(convert_rate=16000, convert_width=2)
-                    uinfo = self.user_info.get(uid, {"id": str(uid), "username": uname})
-                    try:
-                        with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
-                            wf_out.write(wav_16k)
-                    except Exception:
-                        pass
-                    if self.loop and self.loop.is_running():
-                        asyncio.run_coroutine_threadsafe(self._process_stt_wav(uid, uinfo, wav_16k), self.loop)
-                except Exception as e:
-                    dbg_log = _get_data_dir() / "voice_debug.log"
-                    with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] ❌ SpeechRecognition phrase error: {e}\n")
+        user_buf = self._user_buffers[uid]
+        res = user_buf.process_frame(pcm_bytes)
+        if res:
+            raw_pcm, dur, avg_rms = res
+            if self.loop and self.loop.is_running():
+                asyncio.run_coroutine_threadsafe(self._process_stt_raw_pcm(uid, uinfo, raw_pcm, dur, avg_rms), self.loop)
 
-            src = DiscordSRAudioSource(buf)
-            self._stoppers[uid] = rec.listen_in_background(src, _on_phrase_audio, phrase_time_limit=15)
-            dbg_log = _get_data_dir() / "voice_debug.log"
-            with open(dbg_log, "a") as f:
-                f.write(f"[{datetime.now()}] 🎧 Background recognizer started for {uname}\n")
-
-        self._buffers[uid].extend(pcm_bytes)
+    async def _inactivity_loop(self) -> None:
+        """Check for speakers who paused and Discord stopped sending UDP packets (DTX)."""
+        while self._running:
+            try:
+                await asyncio.sleep(0.15)
+                now = time.time()
+                for uid, user_buf in list(self._user_buffers.items()):
+                    res = user_buf.flush_if_timed_out(now, timeout=0.75)
+                    if res:
+                        raw_pcm, dur, avg_rms = res
+                        uinfo = self.user_info.get(uid, {"id": str(uid), "username": user_buf.uname})
+                        if self.loop and self.loop.is_running():
+                            asyncio.run_coroutine_threadsafe(self._process_stt_raw_pcm(uid, uinfo, raw_pcm, dur, avg_rms), self.loop)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
 
     def _is_whisper_hallucination(self, text: str) -> bool:
-        """Filter out common Whisper hallucinations generated on silence or low noise."""
-        cleaned = text.lower().strip().rstrip(".!?,")
-        if not cleaned:
+        """Filter out common Whisper hallucinations generated on background noise or silence."""
+        if not text or not text.strip():
             return True
-        if (cleaned.startswith("[") and cleaned.endswith("]")) or (cleaned.startswith("(") and cleaned.endswith(")")):
+        cleaned = text.strip()
+        lower = cleaned.lower().strip("\"'«»`").rstrip(".!?,;:").strip()
+        if not lower:
             return True
-        if cleaned in ["конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд", "звучит музыка", "музыка", "аплодисменты", "тишина"]:
-            return True
-        hallucinations = [
-            "продолжение следует",
-            "субтитры",
-            "редактор",
-            "корректор",
-            "перевод",
-            "спасибо за просмотр",
-            "подписывайтесь",
-            "ставьте лайк",
-            "thank you for watching",
-            "thanks for watching",
-            "please subscribe",
-            "dimatorzok",
-            "диматорзок",
-            "semkin",
-            "семкин",
-            "звучит музыка",
-            "благодарю за внимание",
-            "сообществом",
-            "читайте на",
-        ]
-        return any(h in cleaned for h in hallucinations)
 
-    async def _process_stt_wav(self, uid: int, uinfo: Dict[str, Any], wav_bytes: bytes) -> None:
+        # Tag-like hallucinations: [музыка], (тишина), *аплодисменты*, etc.
+        if (lower.startswith("[") and lower.endswith("]")) or (lower.startswith("(") and lower.endswith(")")) or (lower.startswith("*") and lower.endswith("*")):
+            return True
+
+        # Exact match short hallucinations
+        exact_list = {
+            "конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд",
+            "звучит музыка", "музыка", "аплодисменты", "тишина", "звук", "топ 5", "топ-5", "топ 10", "топ-10",
+            "а-а-а", "ааа", "о-о-о", "ооо", "продолжение следует", "субтитры", "dimatorzok", "диматорзок",
+            "semkin", "семкин", "пауза", "шум", "клики", "перевод", "редактор", "корректор",
+        }
+        if lower in exact_list:
+            return True
+
+        # Substring indicators of subtitle / video artifacts
+        sub_patterns = [
+            r"субтитр",
+            r"dimatorzok",
+            r"диматорзок",
+            r"семкин",
+            r"semkin",
+            r"продолжение следует",
+            r"редактор",
+            r"корректор",
+            r"перевод",
+            r"озвучк",
+            r"озвучено",
+            r"спасибо за просмотр",
+            r"спасибо за внимание",
+            r"благодарю за внимание",
+            r"подписывайтесь",
+            r"ставьте лайк",
+            r"колокольчик",
+            r"thank you for watching",
+            r"thanks for watching",
+            r"please subscribe",
+            r"like and subscribe",
+            r"звучит музыка",
+            r"сообществом",
+            r"читайте на",
+            r"до новых встреч",
+            r"до скорой встречи",
+            r"приятного просмотра",
+            r"всем пока",
+            r"всем привет",
+            r"автор сценария",
+            r"режиссер",
+            r"vk\.com",
+            r"youtube\.com",
+        ]
+        for pat in sub_patterns:
+            if re.search(pat, lower):
+                return True
+
+        # Repetitive single word loop hallucination (e.g. "да да да да да", "а а а а")
+        words = lower.split()
+        if len(words) >= 4 and len(set(words)) == 1:
+            return True
+
+        return False
+
+    async def _process_stt_raw_pcm(self, uid: int, uinfo: Dict[str, Any], raw_pcm: bytes, duration_sec: float, avg_rms: float) -> None:
         dbg_log = _get_data_dir() / "voice_debug.log"
         username = uinfo.get("username") or "Speaker"
+
+        # Preprocess raw PCM to clean 16kHz mono WAV
+        wav_bytes = _pcm_to_clean_wav(raw_pcm)
+        if not wav_bytes or len(wav_bytes) < 100:
+            return
+
+        # Save debug wav for local inspection
+        try:
+            with open("/tmp/unai_last_voice.wav", "wb") as wf_out:
+                wf_out.write(wav_bytes)
+        except Exception:
+            pass
+
         try:
             with open(dbg_log, "a") as f:
-                f.write(f"[{datetime.now()}] 🚀 [STT SEND] Transcribing {len(wav_bytes)} bytes audio for {username}...\n")
+                f.write(f"[{datetime.now()}] 🚀 [STT SEND] Transcribing {duration_sec:.1f}s audio (avg RMS {int(avg_rms)}) for {username}...\n")
         except Exception:
             pass
 
@@ -342,9 +462,15 @@ class STTVoiceSink(AudioSinkBase):
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
+        preferred_model = cfg.get("model", "groq/whisper-large-v3-turbo")
 
-        # Models with fallback on 429 rate limit or server error
-        models_to_try = ["groq/whisper-large-v3", "groq/whisper-large-v3-turbo"]
+        models_to_try = [preferred_model]
+        if "groq/whisper-large-v3" not in models_to_try:
+            models_to_try.append("groq/whisper-large-v3")
+        if "groq/whisper-large-v3-turbo" not in models_to_try:
+            models_to_try.append("groq/whisper-large-v3-turbo")
+
+        prompt_text = "Голосовой чат Discord, живой разговор, реплики пользователей без титров и субтитров."
 
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
             for model in models_to_try:
@@ -353,10 +479,12 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                     form.add_field("model", model)
                     form.add_field("language", lang)
+                    form.add_field("prompt", prompt_text)
+                    form.add_field("temperature", "0")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=12) as resp:
+                        async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 candidate = data.get("text", "").strip()
@@ -392,7 +520,7 @@ class STTVoiceSink(AudioSinkBase):
             if candidate and not self._is_whisper_hallucination(candidate):
                 text = candidate
                 with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] Google STT recognized for {uinfo.get('username')}: '{text}'\n")
+                    f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Google STT for {username}: '{text}'\n")
 
         if text and text.strip():
             self.transcripts_count += 1
@@ -407,10 +535,14 @@ class STTVoiceSink(AudioSinkBase):
                 "read": False,
             }
             if self.callback:
-                self.callback(notif)
+                try:
+                    self.callback(notif)
+                except Exception as cb_err:
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] ❌ Transcript callback error: {cb_err}\n")
 
     def _drop_user(self, uid: int) -> None:
-        self.user_vads.pop(uid, None)
+        self._user_buffers.pop(uid, None)
         self.user_info.pop(uid, None)
 
     def get_stats(self) -> Dict[str, Any]:
@@ -420,19 +552,15 @@ class STTVoiceSink(AudioSinkBase):
             "transcripts_count": self.transcripts_count,
             "speakers": list(self.speakers),
             "last_packet_seconds_ago": round(time.time() - self.last_packet_time, 1) if self.last_packet_time else None,
+            "active_buffers": len(self._user_buffers),
             "running": self._running,
         }
 
     def cleanup(self) -> None:
         self._running = False
-        for stopper in list(self._stoppers.values()):
-            try:
-                stopper(wait=False)
-            except Exception:
-                pass
-        self._stoppers.clear()
-        self._buffers.clear()
-        self._recognizers.clear()
+        if self._inactivity_task and not self._inactivity_task.done():
+            self._inactivity_task.cancel()
+        self._user_buffers.clear()
 
 
 class VoiceManager:
