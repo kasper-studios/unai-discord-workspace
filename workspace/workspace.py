@@ -120,21 +120,27 @@ try:
 
     _vr_reader.UDPKeepAlive.run = _fixed_udp_keepalive_run
 
-    # DAVE (Discord E2EE MLS Ratchet) decryption hook
+    # DAVE (Discord E2EE MLS) decryption hook:
+    # Must happen BEFORE opus decode since decrypted_data still has the MLS inner layer.
+    # We patch _decode_packet to decrypt the DAVE layer from decrypted_data before passing to Decoder.
     _orig_decode_packet = _vr_router.PacketDecoder._decode_packet
 
     def _dave_aware_decode_packet(self, packet):
+        # Only attempt DAVE decrypt if packet has data (not a FakePacket)
         if packet and hasattr(packet, 'decrypted_data') and packet.decrypted_data:
             vc = getattr(self.sink, 'voice_client', None)
             if vc and hasattr(vc, '_connection') and vc._connection:
                 dave_session = getattr(vc._connection, 'dave_session', None)
-                user_id = getattr(self, '_cached_id', None) or (vc._get_id_from_ssrc(self.ssrc) if hasattr(vc, '_get_id_from_ssrc') else None) or 0
-                if dave_session and getattr(dave_session, 'ready', False) and user_id:
+                user_id = self._cached_id or 0
+                if dave_session and user_id:
+                    # Only decrypt if user doesn't have passthrough (i.e. is E2EE encrypted)
                     try:
-                        decrypted = dave_session.decrypt(user_id, davey.MediaType.audio, packet.decrypted_data)
-                        if decrypted:
-                            packet.decrypted_data = decrypted
+                        if not dave_session.can_passthrough(user_id):
+                            decrypted = dave_session.decrypt(user_id, davey.MediaType.audio, packet.decrypted_data)
+                            if decrypted:
+                                packet.decrypted_data = decrypted
                     except Exception as dave_err:
+                        # Log but don't block — fall through to opus decode with original data
                         try:
                             dbg_log = _get_data_dir() / "voice_debug.log"
                             with open(dbg_log, "a") as f:
