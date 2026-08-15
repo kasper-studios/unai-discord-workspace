@@ -259,12 +259,12 @@ class UserVoiceBuffer:
     - Pre-speech circular buffer (~400ms) to ensure phrase onsets are preserved
     """
 
-    def __init__(self, uid: int, uname: str, vad_mode: int = 1, min_energy: int = 250):
+    def __init__(self, uid: int, uname: str, vad_mode: int = 0, min_energy: int = 150):
         self.uid = uid
         self.uname = uname
         self.vad_mode = vad_mode
         self._vad = webrtcvad.Vad(vad_mode) if webrtcvad else None
-        self.noise_floor_rms: float = 250.0
+        self.noise_floor_rms: float = 150.0
         self.min_energy = min_energy
         self.pre_buffer: collections.deque = collections.deque(maxlen=20)  # ~400ms pre-speech ring buffer
         self.phrase_frames: List[bytes] = []
@@ -278,7 +278,7 @@ class UserVoiceBuffer:
         self.phrase_start_time: float = 0.0
 
     def _is_frame_speech(self, pcm_bytes: bytes) -> Tuple[bool, float, float]:
-        """Check if 20ms frame contains speech using WebRTC VAD + ZCR + Adaptive Gate."""
+        """Check if 20ms frame contains speech using WebRTC VAD + Adaptive RMS Gate."""
         try:
             frame_rms = float(audioop.rms(pcm_bytes, 2))
         except Exception:
@@ -306,19 +306,17 @@ class UserVoiceBuffer:
             except Exception:
                 is_vad_active = False
 
-        # Dynamic speech threshold based on user's background noise
-        dynamic_thresh = max(self.min_energy, self.noise_floor_rms * 1.15)
+        # Dynamic speech threshold: trigger if WebRTC VAD detects speech OR energy is above baseline
+        dynamic_thresh = max(self.min_energy, self.noise_floor_rms * 1.10)
         has_enough_energy = frame_rms >= dynamic_thresh
 
-        # Human speech rarely has ZCR > 0.45 (typical is 0.05 - 0.35; static/hiss is ~0.50 - 0.60)
-        not_white_noise = zcr <= 0.45
-
+        # Speech condition: WebRTC VAD active or energy spike with reasonable ZCR
         if self._vad:
-            is_speech = is_vad_active and has_enough_energy and not_white_noise
+            is_speech = is_vad_active or (has_enough_energy and zcr <= 0.55)
         else:
-            is_speech = has_enough_energy and not_white_noise and (frame_rms >= self.noise_floor_rms * 1.3)
+            is_speech = has_enough_energy and zcr <= 0.55
 
-        if not is_speech and frame_rms > 50:
+        if not is_speech and 30 < frame_rms < 1000:
             # Update ambient noise floor with slow exponential moving average
             self.noise_floor_rms = 0.96 * self.noise_floor_rms + 0.04 * frame_rms
 
@@ -341,13 +339,13 @@ class UserVoiceBuffer:
         now = time.time()
         self.last_packet_time = now
 
-        is_speech, frame_rms, _ = self._is_frame_speech(pcm_bytes)
+        is_speech, frame_rms, zcr = self._is_frame_speech(pcm_bytes)
 
         if not self.is_speaking:
             if is_speech:
                 self.consecutive_speech_frames += 1
-                # Require 3 consecutive speech frames (~60ms) to trigger phrase start
-                if self.consecutive_speech_frames >= 3:
+                # Require 2 consecutive speech frames (~40ms) to trigger phrase start
+                if self.consecutive_speech_frames >= 2:
                     self.is_speaking = True
                     self.phrase_start_time = now
                     self.phrase_frames = list(self.pre_buffer) + [pcm_bytes]
@@ -375,8 +373,8 @@ class UserVoiceBuffer:
         else:
             self.silence_frame_count += 1
 
-        # End of phrase condition 1: ~700ms (35 frames) of natural pause silence
-        if self.silence_frame_count >= 35:
+        # End of phrase condition 1: ~500ms (25 frames) of silence
+        if self.silence_frame_count >= 25:
             return self._flush_phrase()
 
         # End of phrase condition 2: max phrase duration ~15.0s (750 frames)
@@ -385,7 +383,7 @@ class UserVoiceBuffer:
 
         return None
 
-    def flush_if_timed_out(self, now: float, timeout: float = 0.75) -> Optional[Tuple[bytes, float, float]]:
+    def flush_if_timed_out(self, now: float, timeout: float = 0.40) -> Optional[Tuple[bytes, float, float]]:
         """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
         if self.is_speaking and (now - self.last_packet_time >= timeout):
             return self._flush_phrase()
@@ -411,20 +409,14 @@ class UserVoiceBuffer:
         total_frames = len(frames)
         duration_sec = total_frames * 0.02
         avg_rms = voiced_rms / max(1, voiced_cnt)
-        voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Validation to reject tiny noise clicks (allow short words down to 0.20s):
-        if duration_sec < 0.20 or voiced_cnt < 3 or voiced_ratio < 0.15 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.05):
-            try:
-                dbg_log = _get_data_dir() / "voice_debug.log"
-                with open(dbg_log, "a") as f:
-                    f.write(f"[{datetime.now()}] 💨 [VAD SKIP] Dropped sub-threshold phrase for {self.uname}: dur={duration_sec:.2f}s, voiced={voiced_cnt} frames, avg RMS={int(avg_rms)}\n")
-            except Exception:
-                pass
+        # Allow short genuine speech phrases
+        if duration_sec < 0.18 or voiced_cnt < 2:
             return None
 
         raw_pcm = b"".join(frames)
         return (raw_pcm, duration_sec, avg_rms)
+
 
 
 
