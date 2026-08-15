@@ -269,6 +269,12 @@ class UserVoiceBuffer:
                     self.silence_frame_count = 0
                     self.voiced_frame_count = self.consecutive_speech_frames
                     self.voiced_rms_sum = frame_rms * self.consecutive_speech_frames
+                    try:
+                        dbg_log = _get_data_dir() / "voice_debug.log"
+                        with open(dbg_log, "a") as f:
+                            f.write(f"[{datetime.now()}] 🎙️ [VAD START] {self.uname} speech detected (RMS {int(frame_rms)}, noise floor {int(self.noise_floor_rms)}, ZCR {zcr:.2f})\n")
+                    except Exception:
+                        pass
             else:
                 self.consecutive_speech_frames = 0
                 self.pre_buffer.append(pcm_bytes)
@@ -321,12 +327,14 @@ class UserVoiceBuffer:
         avg_rms = voiced_rms / max(1, voiced_cnt)
         voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Stricter phrase validation to reject noise clicks & hum:
-        # - Duration must be >= 0.5s
-        # - Must contain at least 8 voiced frames (~160ms of verified speech)
-        # - Voiced frame ratio must be >= 20%
-        # - Average speech RMS must be above dynamic noise floor
+        # Validation to reject tiny noise clicks:
         if duration_sec < 0.5 or voiced_cnt < 8 or voiced_ratio < 0.20 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.15):
+            try:
+                dbg_log = _get_data_dir() / "voice_debug.log"
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] 💨 [VAD SKIP] Dropped sub-threshold phrase for {self.uname}: dur={duration_sec:.2f}s, voiced={voiced_cnt} frames, avg RMS={int(avg_rms)}\n")
+            except Exception:
+                pass
             return None
 
         raw_pcm = b"".join(frames)
@@ -358,6 +366,7 @@ class STTVoiceSink(AudioSinkBase):
         self.transcripts_count: int = 0
         self.last_packet_time: float = 0.0
         self.speakers: Set[str] = set()
+        self._seen_speakers: Set[int] = set()
         self._running = True
 
         if self.loop and self.loop.is_running():
@@ -384,6 +393,16 @@ class STTVoiceSink(AudioSinkBase):
         self.bytes_received += len(pcm_bytes)
         self.last_packet_time = now
         self.speakers.add(uname)
+
+        if uid not in self._seen_speakers:
+            self._seen_speakers.add(uid)
+            try:
+                dbg_log = _get_data_dir() / "voice_debug.log"
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] 📡 [VOICE RECV] Audio packets arriving from {uname} (UID: {uid}, SSRC: {ssrc})\n")
+            except Exception:
+                pass
+
 
         uinfo = {
             "id": str(user_id or uid),
@@ -784,6 +803,13 @@ class VoiceManager:
         if hasattr(vc, "listen"):
             vc.listen(sink)
         self._active_sinks[gid] = sink
+        try:
+            dbg_log = _get_data_dir() / "voice_debug.log"
+            with open(dbg_log, "a") as f:
+                f.write(f"[{datetime.now()}] 🎧 [LISTEN START] Voice listener attached to '{vc.channel.name}' in '{vc.guild.name}'. STT Model: {stt_config.get('model', 'default') if stt_config else 'default'}\n")
+        except Exception:
+            pass
+
         return {
             "channel_id": str(vc.channel.id),
             "channel_name": vc.channel.name,
