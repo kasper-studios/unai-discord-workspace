@@ -140,13 +140,15 @@ try:
                             if decrypted:
                                 packet.decrypted_data = decrypted
                     except Exception as dave_err:
-                        # Log but don't block — fall through to opus decode with original data
-                        try:
-                            dbg_log = _get_data_dir() / "voice_debug.log"
-                            with open(dbg_log, "a") as f:
-                                f.write(f"[{datetime.now()}] ⚠️ [DAVE DECRYPT ERR] uid {user_id}: {dave_err}\n")
-                        except Exception:
-                            pass
+                        err_str = str(dave_err)
+                        if "UnencryptedWhenPassthroughDisabled" not in err_str and "NoDecryptorForUser" not in err_str:
+                            try:
+                                dbg_log = _get_data_dir() / "voice_debug.log"
+                                with open(dbg_log, "a") as f:
+                                    f.write(f"[{datetime.now()}] ⚠️ [DAVE DECRYPT ERR] uid {user_id}: {dave_err}\n")
+                            except Exception:
+                                pass
+
         return _orig_decode_packet(self, packet)
 
     _vr_router.PacketDecoder._decode_packet = _dave_aware_decode_packet
@@ -242,20 +244,21 @@ class UserVoiceBuffer:
     - WebRTC VAD (GMM spectral model across 6 frequency bands)
     - Adaptive Noise Floor Tracking (EMA per-speaker baseline)
     - Zero-Crossing Rate (ZCR) filtering (rejects high-frequency hiss / fans)
-    - Pre-speech circular buffer (~300ms) to ensure phrase onsets are preserved
+    - Pre-speech circular buffer (~400ms) to ensure phrase onsets are preserved
     """
 
-    def __init__(self, uid: int, uname: str, vad_mode: int = 2, min_energy: int = 600):
+    def __init__(self, uid: int, uname: str, vad_mode: int = 1, min_energy: int = 250):
         self.uid = uid
         self.uname = uname
         self.vad_mode = vad_mode
         self._vad = webrtcvad.Vad(vad_mode) if webrtcvad else None
-        self.noise_floor_rms: float = 600.0
+        self.noise_floor_rms: float = 250.0
         self.min_energy = min_energy
         self.pre_buffer: collections.deque = collections.deque(maxlen=20)  # ~400ms pre-speech ring buffer
         self.phrase_frames: List[bytes] = []
         self.is_speaking: bool = False
         self.consecutive_speech_frames: int = 0
+
         self.silence_frame_count: int = 0
         self.voiced_frame_count: int = 0
         self.voiced_rms_sum: float = 0.0
@@ -398,8 +401,8 @@ class UserVoiceBuffer:
         avg_rms = voiced_rms / max(1, voiced_cnt)
         voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Validation to reject tiny noise clicks:
-        if duration_sec < 0.5 or voiced_cnt < 8 or voiced_ratio < 0.20 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.15):
+        # Validation to reject tiny noise clicks (allow short words down to 0.20s):
+        if duration_sec < 0.20 or voiced_cnt < 3 or voiced_ratio < 0.15 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.05):
             try:
                 dbg_log = _get_data_dir() / "voice_debug.log"
                 with open(dbg_log, "a") as f:
@@ -487,8 +490,8 @@ class STTVoiceSink(AudioSinkBase):
             self._inactivity_task = self.loop.create_task(self._inactivity_loop())
 
         if uid not in self._user_buffers:
-            vad_mode = int(self.stt_config.get("vad_mode", 2))
-            min_energy = int(self.stt_config.get("min_energy", 600))
+            vad_mode = int(self.stt_config.get("vad_mode", 1))
+            min_energy = int(self.stt_config.get("min_energy", 250))
             self._user_buffers[uid] = UserVoiceBuffer(uid=uid, uname=uname, vad_mode=vad_mode, min_energy=min_energy)
 
         user_buf = self._user_buffers[uid]
@@ -510,11 +513,12 @@ class STTVoiceSink(AudioSinkBase):
                         raw_pcm, dur, avg_rms = res
                         uinfo = self.user_info.get(uid, {"id": str(uid), "username": user_buf.uname})
                         if self.loop and self.loop.is_running():
-                            asyncio.run_coroutine_threadsafe(self._process_stt_raw_pcm(uid, uinfo, raw_pcm, dur, avg_rms), self.loop)
+                            self.loop.create_task(self._process_stt_raw_pcm(uid, uinfo, raw_pcm, dur, avg_rms))
             except asyncio.CancelledError:
                 break
             except Exception:
                 pass
+
 
     def _is_whisper_hallucination(self, text: str) -> bool:
         """Filter out common Whisper hallucinations generated on background noise or silence."""
