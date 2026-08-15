@@ -120,36 +120,58 @@ try:
 
     _vr_reader.UDPKeepAlive.run = _fixed_udp_keepalive_run
 
-    # DAVE (Discord E2EE MLS) decryption hook:
-    # Must happen BEFORE opus decode since decrypted_data still has the MLS inner layer.
-    # We patch _decode_packet to decrypt the DAVE layer from decrypted_data before passing to Decoder.
-    _orig_decode_packet = _vr_router.PacketDecoder._decode_packet
+    # Crash-proof PacketDecoder._decode_packet (with DAVE MLS support and Opus error resilience)
+    def _safe_decode_packet(self, packet):
+        assert self._decoder is not None
+        try:
+            if packet and hasattr(packet, 'decrypted_data') and packet.decrypted_data:
+                vc = getattr(self.sink, 'voice_client', None)
+                if vc and hasattr(vc, '_connection') and vc._connection:
+                    dave_session = getattr(vc._connection, 'dave_session', None)
+                    user_id = self._cached_id or 0
+                    if dave_session and user_id:
+                        try:
+                            if not dave_session.can_passthrough(user_id):
+                                decrypted = dave_session.decrypt(user_id, davey.MediaType.audio, packet.decrypted_data)
+                                if decrypted:
+                                    packet.decrypted_data = decrypted
+                        except Exception:
+                            pass
+                pcm = self._decoder.decode(packet.decrypted_data, fec=False)
+                return packet, pcm
+            elif packet:
+                pcm = self._decoder.decode(packet.decrypted_data, fec=False)
+                return packet, pcm
+            else:
+                next_packet = self._buffer.peek_next()
+                if next_packet is not None:
+                    pcm = self._decoder.decode(getattr(next_packet, 'decrypted_data', None), fec=True)
+                else:
+                    pcm = self._decoder.decode(None, fec=False)
+                return packet, pcm
+        except Exception:
+            # Return silence on malformed/corrupted frames instead of crashing the PacketRouter thread
+            return packet, b'\x00' * 3840
 
-    def _dave_aware_decode_packet(self, packet):
-        # Only attempt DAVE decrypt if packet has data (not a FakePacket)
-        if packet and hasattr(packet, 'decrypted_data') and packet.decrypted_data:
-            vc = getattr(self.sink, 'voice_client', None)
-            if vc and hasattr(vc, '_connection') and vc._connection:
-                dave_session = getattr(vc._connection, 'dave_session', None)
-                user_id = self._cached_id or 0
-                if dave_session and user_id:
-                    # Only decrypt if user doesn't have passthrough (i.e. is E2EE encrypted)
-                    try:
-                        if not dave_session.can_passthrough(user_id):
-                            decrypted = dave_session.decrypt(user_id, davey.MediaType.audio, packet.decrypted_data)
-                            if decrypted:
-                                packet.decrypted_data = decrypted
-                    except Exception as dave_err:
-                        err_str = str(dave_err)
-                        if "UnencryptedWhenPassthroughDisabled" not in err_str and "NoDecryptorForUser" not in err_str:
-                            try:
-                                dbg_log = _get_data_dir() / "voice_debug.log"
-                                with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] ⚠️ [DAVE DECRYPT ERR] uid {user_id}: {dave_err}\n")
-                            except Exception:
-                                pass
+    _vr_router.PacketDecoder._decode_packet = _safe_decode_packet
 
-        return _orig_decode_packet(self, packet)
+    # Crash-proof PacketRouter._do_run (ensures reader never calls stop_listening() on transient errors)
+    def _safe_packet_router_do_run(self) -> None:
+        while not self._end_thread.is_set():
+            try:
+                self.waiter.wait()
+                with self._lock:
+                    for decoder in list(self.waiter.items):
+                        try:
+                            data = decoder.pop_data()
+                            if data is not None:
+                                self.sink.write(data.source, data)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    _vr_router.PacketRouter._do_run = _safe_packet_router_do_run
 
     # Prevent single packet or decrypt glitches from stopping the AudioReader listener thread
     _orig_reader_callback = _vr_reader.AudioReader.callback
@@ -165,6 +187,7 @@ try:
     _vr_reader.AudioReader.callback = _safe_reader_callback
 
     AudioSinkBase = voice_recv.AudioSink
+
 
 except Exception:
     try:
@@ -373,31 +396,35 @@ class UserVoiceBuffer:
         else:
             self.silence_frame_count += 1
 
-        # End of phrase condition 1: ~500ms (25 frames) of silence
-        if self.silence_frame_count >= 25:
-            return self._flush_phrase()
+        # End of phrase condition 1: ~400ms (20 frames) of natural pause silence
+        if self.silence_frame_count >= 20:
+            return self._flush_phrase(continued=False)
 
-        # End of phrase condition 2: max phrase duration ~15.0s (750 frames)
+        # End of phrase condition 2: natural sentence break (micro-pause >= 160ms) if phrase is already >= 10.0s
+        if len(self.phrase_frames) >= 500 and self.silence_frame_count >= 8:
+            return self._flush_phrase(continued=False)
+
+        # End of phrase condition 3: max phrase duration 15.0s (750 frames) for continuous non-stop speech
         if len(self.phrase_frames) >= 750:
-            return self._flush_phrase()
+            return self._flush_phrase(continued=True)
 
         return None
 
-    def flush_if_timed_out(self, now: float, timeout: float = 0.40) -> Optional[Tuple[bytes, float, float]]:
+    def flush_if_timed_out(self, now: float, timeout: float = 0.35) -> Optional[Tuple[bytes, float, float]]:
         """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
         if self.is_speaking and (now - self.last_packet_time >= timeout):
-            return self._flush_phrase()
+            return self._flush_phrase(continued=False)
         return None
 
-    def _flush_phrase(self) -> Optional[Tuple[bytes, float, float]]:
+    def _flush_phrase(self, continued: bool = False) -> Optional[Tuple[bytes, float, float]]:
         """Finalize current speech phrase and validate before dispatching."""
         frames = self.phrase_frames
         voiced_cnt = self.voiced_frame_count
         voiced_rms = self.voiced_rms_sum
 
-        # Reset state
-        self.is_speaking = False
-        self.consecutive_speech_frames = 0
+        # Reset state with smooth rollover if user continues speaking non-stop
+        self.is_speaking = continued
+        self.consecutive_speech_frames = 2 if continued else 0
         self.silence_frame_count = 0
         self.voiced_frame_count = 0
         self.voiced_rms_sum = 0.0
@@ -416,6 +443,7 @@ class UserVoiceBuffer:
 
         raw_pcm = b"".join(frames)
         return (raw_pcm, duration_sec, avg_rms)
+
 
 
 
