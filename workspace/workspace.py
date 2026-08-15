@@ -562,7 +562,7 @@ class STTVoiceSink(AudioSinkBase):
 
 
     def _is_whisper_hallucination(self, text: str) -> bool:
-        """Filter out common Whisper hallucinations generated on background noise or silence."""
+        """Filter out obvious Whisper subtitle/bracket artifacts only."""
         if not text or not text.strip():
             return True
         cleaned = text.strip()
@@ -570,94 +570,26 @@ class STTVoiceSink(AudioSinkBase):
         if not lower:
             return True
 
-        # 1. Tag-like artifacts: [музыка], (тишина), *аплодисменты*, etc.
+        # 1. Bracket artifacts: [музыка], (тишина), *аплодисменты*, etc.
         if (lower.startswith("[") and lower.endswith("]")) or (lower.startswith("(") and lower.endswith(")")) or (lower.startswith("*") and lower.endswith("*")):
             return True
 
-        # 2. Exact match short hallucinations and prompt echoes
-        exact_list = {
-            "конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд",
-            "звучит музыка", "музыка", "аплодисменты", "тишина", "звук", "топ 5", "топ-5", "топ 10", "топ-10",
-            "а-а-а", "ааа", "о-о-о", "ооо", "продолжение следует", "субтитры", "dimatorzok", "диматорзок",
-            "semkin", "семкин", "пауза", "шум", "клики", "перевод", "редактор", "корректор",
-            "голосовой чат", "голосовой чатеринка", "голос", "чат", "писк", "звонок", "discord",
-            "ну, а что, а", "ну а что а", "ну, а что", "ну а что", "звук салона", "звук сна",
-            "пищевую воду", "пищевая вода", "а, да", "а да", "а, да, да", "а да да", "угу, давай",
+        # 2. Only blatant subtitle artifacts
+        blatant = {
+            "продолжение следует",
+            "субтитры",
+            "dimatorzok",
+            "диматорзок",
         }
-        if lower in exact_list:
+        if lower in blatant:
             return True
 
-        # 3. Clause repetitions (split by commas/periods)
-        clauses = [re.sub(r'^(ну|а|и|да)\s+', '', s.strip()).strip() for s in re.split(r'[,.!?]+', lower) if len(s.strip()) > 3]
-        if len(clauses) >= 2 and len(clauses) != len(set(clauses)):
-            return True
-
-        # 4. N-gram repetition loop detection (e.g. 'да да да', 'я не знаю я не знаю')
-        words = [w.strip(".,!?\"'«»`") for w in lower.split() if w.strip(".,!?\"'«»`")]
-        if len(words) >= 3 and len(set(words)) == 1:
-            return True
-
-        # Single-word dominance in short transcripts
-        counts = collections.Counter(words)
-        if len(words) >= 5 and any(count >= 3 and (count / len(words)) >= 0.40 for count in counts.values()):
-            return True
-
-        for n in [2, 3, 4]:
-            if len(words) >= n * 2:
-                ngrams = [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
-                ngram_counts = collections.Counter(ngrams)
-                for ng, cnt in ngram_counts.items():
-                    if cnt >= 2 and n >= 3:
-                        return True
-                    if cnt >= 3 and n == 2:
-                        return True
-
-
-        # 5. Substring indicators of subtitle / video artifacts
-        sub_patterns = [
-            r"субтитр",
-            r"dimatorzok",
-            r"диматорзок",
-            r"семкин",
-            r"semkin",
-            r"продолжение следует",
-            r"редактор",
-            r"корректор",
-            r"перевод",
-            r"озвучк",
-            r"озвучено",
-            r"спасибо за просмотр",
-            r"спасибо за внимание",
-            r"благодарю за внимание",
-            r"подписывайтесь",
-            r"ставьте лайк",
-            r"колокольчик",
-            r"thank you for watching",
-            r"thanks for watching",
-            r"please subscribe",
-            r"like and subscribe",
-            r"звучит музыка",
-            r"сообществом",
-            r"читайте на",
-            r"до новых встреч",
-            r"до скорой встречи",
-            r"приятного просмотра",
-            r"всем пока",
-            r"всем привет",
-            r"автор сценария",
-            r"режиссер",
-            r"vk\.com",
-            r"youtube\.com",
-            r"голосовой чат",
-            r"пищевую воду",
-            r"звук салона",
-            r"звук сна",
-        ]
-        for pat in sub_patterns:
+        for pat in [r"продолжение следует", r"dimatorzok", r"диматорзок", r"^субтитры"]:
             if re.search(pat, lower):
                 return True
 
         return False
+
 
     async def _process_stt_raw_pcm(self, uid: int, uinfo: Dict[str, Any], raw_pcm: bytes, duration_sec: float, avg_rms: float) -> None:
         dbg_log = _get_data_dir() / "voice_debug.log"
@@ -729,24 +661,17 @@ class STTVoiceSink(AudioSinkBase):
 
                                 if segments:
                                     avg_no_speech = sum(s.get("no_speech_prob", 0.0) for s in segments) / len(segments)
-                                    max_no_speech = max(s.get("no_speech_prob", 0.0) for s in segments)
                                     avg_logprob = sum(s.get("avg_logprob", 0.0) for s in segments) / len(segments)
-                                    max_compression = max(s.get("compression_ratio", 1.0) for s in segments)
 
-                                    if avg_no_speech > 0.45 or max_no_speech > 0.65:
+                                    if avg_no_speech > 0.85 and avg_logprob < -1.5:
                                         is_hallucination = True
-                                        reject_reasons.append(f"no_speech_prob (avg {avg_no_speech:.2f}, max {max_no_speech:.2f})")
-                                    if avg_logprob < -0.90:
-                                        is_hallucination = True
-                                        reject_reasons.append(f"low logprob ({avg_logprob:.2f})")
-                                    if max_compression > 2.2:
-                                        is_hallucination = True
-                                        reject_reasons.append(f"high compression_ratio ({max_compression:.2f})")
+                                        reject_reasons.append(f"no_speech_prob ({avg_no_speech:.2f})")
 
                                 candidate = _clean_transcript_text(raw_text)
                                 if not candidate or self._is_whisper_hallucination(candidate):
                                     is_hallucination = True
                                     reject_reasons.append("pattern/loop filter")
+
 
                                 if is_hallucination:
                                     is_rejected_hallucination = True
