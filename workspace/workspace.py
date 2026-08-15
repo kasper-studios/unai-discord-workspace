@@ -96,11 +96,58 @@ except Exception:
 try:
     from discord.ext import voice_recv
     from discord.ext.voice_recv import reader as _vr_reader
+    from discord.ext.voice_recv import router as _vr_router
+    import davey
+
     _vr_reader.UDPKeepAlive.delay = 5
+
+    def _fixed_udp_keepalive_run(self) -> None:
+        self.voice_client.wait_until_connected()
+        while not self._end_thread.is_set():
+            vc = self.voice_client
+            try:
+                packet = self.counter.to_bytes(8, 'big')
+            except OverflowError:
+                self.counter = 0
+                continue
+            try:
+                if hasattr(vc, '_connection') and vc._connection and hasattr(vc._connection, 'socket') and vc._connection.socket:
+                    vc._connection.socket.send(packet)
+            except Exception:
+                pass
+            self.counter += 1
+            time.sleep(self.delay)
+
+    _vr_reader.UDPKeepAlive.run = _fixed_udp_keepalive_run
+
+    # DAVE (Discord E2EE MLS Ratchet) decryption hook
+    _orig_decode_packet = _vr_router.PacketDecoder._decode_packet
+
+    def _dave_aware_decode_packet(self, packet):
+        if packet and hasattr(packet, 'decrypted_data') and packet.decrypted_data:
+            vc = getattr(self.sink, 'voice_client', None)
+            if vc and hasattr(vc, '_connection') and vc._connection:
+                dave_session = getattr(vc._connection, 'dave_session', None)
+                user_id = getattr(self, '_cached_id', None) or (vc._get_id_from_ssrc(self.ssrc) if hasattr(vc, '_get_id_from_ssrc') else None) or 0
+                if dave_session and getattr(dave_session, 'ready', False) and user_id:
+                    try:
+                        decrypted = dave_session.decrypt(davey.MediaType.audio, user_id, packet.decrypted_data)
+                        if decrypted:
+                            packet.decrypted_data = decrypted
+                    except Exception:
+                        pass
+        return _orig_decode_packet(self, packet)
+
+    _vr_router.PacketDecoder._decode_packet = _dave_aware_decode_packet
     AudioSinkBase = voice_recv.AudioSink
 except Exception:
-    class AudioSinkBase:
-        pass
+    try:
+        from discord.ext import voice_recv
+        AudioSinkBase = voice_recv.AudioSink
+    except Exception:
+        class AudioSinkBase:
+            pass
+
 
 
 def _clean_transcript_text(text: str) -> str:
