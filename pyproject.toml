@@ -16,4 +16,6 @@ dependencies = [
     "edge-tts>=7.0.0",
     "yt-dlp>=2024.0.0",
     "SpeechRecognition>=3.10.0",
+    "webrtcvad-wheels>=2.0.10",
 ]
+

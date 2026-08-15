@@ -28,7 +28,13 @@ try:
 except ImportError:
     import audioop_lts as audioop
 
+try:
+    import webrtcvad
+except ImportError:
+    webrtcvad = None
+
 from unai.sdk import Workspace, tool
+
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
@@ -133,7 +139,7 @@ def _clean_transcript_text(text: str) -> str:
     """Normalize transcript casing and deduplicate Whisper repetition loops."""
     if not text or not text.strip():
         return ""
-    t = text.strip()
+    t = text.strip().strip("\"'`«»")
 
     # 1. Deduplicate repetitive sentence/clause patterns (e.g. 'А, да. А, да. А, да.' -> 'А, да.')
     for _ in range(3):
@@ -173,11 +179,12 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
         except Exception:
             pass
 
-        # RMS volume normalization (target healthy speech level ~4800 RMS, avoids distortion & shouting)
+        # Safe volume normalization: only normalize if within healthy speech range
+        # Avoid blindly boosting quiet hiss/static 3x
         try:
             cur_rms = audioop.rms(mono_16k, 2)
-            if cur_rms > 0:
-                factor = min(3.0, max(0.4, 4800.0 / cur_rms))
+            if 1200 <= cur_rms <= 15000:
+                factor = min(1.8, max(0.6, 4500.0 / cur_rms))
                 mono_16k = audioop.mul(mono_16k, 2, factor)
         except Exception:
             pass
@@ -204,74 +211,121 @@ def _pcm_to_clean_wav(raw_pcm: bytes) -> bytes:
 class UserVoiceBuffer:
     """Per-speaker Discrete Voice Activity Detector (VAD) & Phrase Accumulator.
     
-    Processes incoming 20ms 48kHz stereo frames without blocking.
-    Maintains pre-speech history so words aren't clipped, filters out
-    isolated noise clicks, and flushes valid speech phrases on pauses.
+    Combines:
+    - WebRTC VAD (GMM spectral model across 6 frequency bands)
+    - Adaptive Noise Floor Tracking (EMA per-speaker baseline)
+    - Zero-Crossing Rate (ZCR) filtering (rejects high-frequency hiss / fans)
+    - Pre-speech circular buffer (~300ms) to ensure phrase onsets are preserved
     """
 
-    def __init__(self, uid: int, uname: str, energy_threshold: int = 900):
+    def __init__(self, uid: int, uname: str, vad_mode: int = 2, min_energy: int = 600):
         self.uid = uid
         self.uname = uname
-        self.energy_threshold = energy_threshold  # RMS threshold for voiced frame
+        self.vad_mode = vad_mode
+        self._vad = webrtcvad.Vad(vad_mode) if webrtcvad else None
+        self.noise_floor_rms: float = 600.0
+        self.min_energy = min_energy
         self.pre_buffer: collections.deque = collections.deque(maxlen=15)  # ~300ms pre-speech ring buffer
         self.phrase_frames: List[bytes] = []
         self.is_speaking: bool = False
-        self.consecutive_voice_frames: int = 0
+        self.consecutive_speech_frames: int = 0
         self.silence_frame_count: int = 0
         self.voiced_frame_count: int = 0
         self.voiced_rms_sum: float = 0.0
         self.last_packet_time: float = time.time()
         self.phrase_start_time: float = 0.0
 
+    def _is_frame_speech(self, pcm_bytes: bytes) -> Tuple[bool, float, float]:
+        """Check if 20ms frame contains speech using WebRTC VAD + ZCR + Adaptive Gate."""
+        try:
+            frame_rms = float(audioop.rms(pcm_bytes, 2))
+        except Exception:
+            frame_rms = 0.0
+
+        try:
+            mono_48k = audioop.tomono(pcm_bytes, 2, 0.5, 0.5)
+            mono_16k, _ = audioop.ratecv(mono_48k, 2, 1, 48000, 16000, None)
+        except Exception:
+            mono_16k = b""
+
+        # Zero-crossing rate on 16kHz mono (320 samples in 20ms)
+        zcr = 0.0
+        if mono_16k and len(mono_16k) == 640:
+            try:
+                crossings = audioop.cross(mono_16k, 2)
+                zcr = crossings / 320.0
+            except Exception:
+                zcr = 0.0
+
+        is_vad_active = False
+        if self._vad and mono_16k and len(mono_16k) == 640:
+            try:
+                is_vad_active = self._vad.is_speech(mono_16k, 16000)
+            except Exception:
+                is_vad_active = False
+
+        # Dynamic speech threshold based on user's background noise
+        dynamic_thresh = max(self.min_energy, self.noise_floor_rms * 1.25)
+        has_enough_energy = frame_rms >= dynamic_thresh
+
+        # Human speech rarely has ZCR > 0.38 (typical is 0.05 - 0.25; static/hiss is ~0.45 - 0.55)
+        not_white_noise = zcr <= 0.38
+
+        if self._vad:
+            is_speech = is_vad_active and has_enough_energy and not_white_noise
+        else:
+            is_speech = has_enough_energy and not_white_noise and (frame_rms >= self.noise_floor_rms * 1.5)
+
+        if not is_speech and frame_rms > 50:
+            # Update ambient noise floor with slow exponential moving average
+            self.noise_floor_rms = 0.96 * self.noise_floor_rms + 0.04 * frame_rms
+
+        return is_speech, frame_rms, zcr
+
     def process_frame(self, pcm_bytes: bytes) -> Optional[Tuple[bytes, float, float]]:
-        """Process incoming 20ms frame. Returns (raw_pcm, duration_sec, avg_rms) if a valid phrase was completed, else None."""
+        """Process incoming 20ms frame. Returns (raw_pcm, duration_sec, avg_rms) if phrase completed."""
         now = time.time()
         self.last_packet_time = now
 
-        try:
-            frame_rms = audioop.rms(pcm_bytes, 2)
-        except Exception:
-            frame_rms = 0
-
-        is_voice = frame_rms >= self.energy_threshold
+        is_speech, frame_rms, _ = self._is_frame_speech(pcm_bytes)
 
         if not self.is_speaking:
-            if is_voice:
-                self.consecutive_voice_frames += 1
-                # Require 4 consecutive voice frames (~80ms) to trigger speech start, avoiding micro-pops/breaths
-                if self.consecutive_voice_frames >= 4:
+            if is_speech:
+                self.consecutive_speech_frames += 1
+                # Require 4 consecutive speech frames (~80ms) to trigger phrase start
+                if self.consecutive_speech_frames >= 4:
                     self.is_speaking = True
                     self.phrase_start_time = now
                     self.phrase_frames = list(self.pre_buffer) + [pcm_bytes]
                     self.pre_buffer.clear()
                     self.silence_frame_count = 0
-                    self.voiced_frame_count = self.consecutive_voice_frames
-                    self.voiced_rms_sum = sum(audioop.rms(f, 2) for f in self.phrase_frames if audioop.rms(f, 2) >= self.energy_threshold)
+                    self.voiced_frame_count = self.consecutive_speech_frames
+                    self.voiced_rms_sum = frame_rms * self.consecutive_speech_frames
             else:
-                self.consecutive_voice_frames = 0
+                self.consecutive_speech_frames = 0
                 self.pre_buffer.append(pcm_bytes)
             return None
 
         # Already speaking
         self.phrase_frames.append(pcm_bytes)
-        if is_voice:
+        if is_speech:
             self.voiced_frame_count += 1
             self.voiced_rms_sum += frame_rms
             self.silence_frame_count = 0
         else:
             self.silence_frame_count += 1
 
-        # End of phrase condition 1: ~500ms (25 frames) of silence
-        if self.silence_frame_count >= 25:
+        # End of phrase condition 1: ~400ms (20 frames) of silence pause
+        if self.silence_frame_count >= 20:
             return self._flush_phrase()
 
-        # End of phrase condition 2: max phrase duration ~7s (350 frames)
-        if len(self.phrase_frames) >= 350:
+        # End of phrase condition 2: max phrase duration ~8.0s (400 frames)
+        if len(self.phrase_frames) >= 400:
             return self._flush_phrase()
 
         return None
 
-    def flush_if_timed_out(self, now: float, timeout: float = 0.55) -> Optional[Tuple[bytes, float, float]]:
+    def flush_if_timed_out(self, now: float, timeout: float = 0.50) -> Optional[Tuple[bytes, float, float]]:
         """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
         if self.is_speaking and (now - self.last_packet_time >= timeout):
             return self._flush_phrase()
@@ -285,7 +339,7 @@ class UserVoiceBuffer:
 
         # Reset state
         self.is_speaking = False
-        self.consecutive_voice_frames = 0
+        self.consecutive_speech_frames = 0
         self.silence_frame_count = 0
         self.voiced_frame_count = 0
         self.voiced_rms_sum = 0.0
@@ -299,8 +353,12 @@ class UserVoiceBuffer:
         avg_rms = voiced_rms / max(1, voiced_cnt)
         voiced_ratio = voiced_cnt / max(1, total_frames)
 
-        # Validation: phrase must be >= 0.8s, have >= 18 voiced frames (~360ms), voiced ratio >= 30%, and avg RMS >= 700
-        if duration_sec < 0.8 or voiced_cnt < 18 or voiced_ratio < 0.30 or avg_rms < 700:
+        # Stricter phrase validation to reject noise clicks & hum:
+        # - Duration must be >= 0.7s
+        # - Must contain at least 12 voiced frames (~240ms of verified speech)
+        # - Voiced frame ratio must be >= 25%
+        # - Average speech RMS must be above dynamic noise floor
+        if duration_sec < 0.7 or voiced_cnt < 12 or voiced_ratio < 0.25 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.15):
             return None
 
         raw_pcm = b"".join(frames)
@@ -308,7 +366,7 @@ class UserVoiceBuffer:
 
 
 class STTVoiceSink(AudioSinkBase):
-    """Real-time Voice Receiver and Speech-to-Text Sink using discrete Packet VAD."""
+    """Real-time Voice Receiver and Speech-to-Text Sink with WebRTC VAD & Whisper Confidence Gating."""
 
     def __init__(self, callback: Any, language: str = "ru-RU", stt_config: Optional[Dict[str, Any]] = None, loop: Optional[Any] = None):
         super().__init__()
@@ -370,7 +428,9 @@ class STTVoiceSink(AudioSinkBase):
             self._inactivity_task = self.loop.create_task(self._inactivity_loop())
 
         if uid not in self._user_buffers:
-            self._user_buffers[uid] = UserVoiceBuffer(uid=uid, uname=uname)
+            vad_mode = int(self.stt_config.get("vad_mode", 2))
+            min_energy = int(self.stt_config.get("min_energy", 600))
+            self._user_buffers[uid] = UserVoiceBuffer(uid=uid, uname=uname, vad_mode=vad_mode, min_energy=min_energy)
 
         user_buf = self._user_buffers[uid]
         res = user_buf.process_frame(pcm_bytes)
@@ -383,10 +443,10 @@ class STTVoiceSink(AudioSinkBase):
         """Check for speakers who paused and Discord stopped sending UDP packets (DTX)."""
         while self._running:
             try:
-                await asyncio.sleep(0.15)
+                await asyncio.sleep(0.12)
                 now = time.time()
                 for uid, user_buf in list(self._user_buffers.items()):
-                    res = user_buf.flush_if_timed_out(now, timeout=0.75)
+                    res = user_buf.flush_if_timed_out(now, timeout=0.50)
                     if res:
                         raw_pcm, dur, avg_rms = res
                         uinfo = self.user_info.get(uid, {"id": str(uid), "username": user_buf.uname})
@@ -406,22 +466,50 @@ class STTVoiceSink(AudioSinkBase):
         if not lower:
             return True
 
-        # Tag-like hallucinations: [музыка], (тишина), *аплодисменты*, etc.
+        # 1. Tag-like artifacts: [музыка], (тишина), *аплодисменты*, etc.
         if (lower.startswith("[") and lower.endswith("]")) or (lower.startswith("(") and lower.endswith(")")) or (lower.startswith("*") and lower.endswith("*")):
             return True
 
-        # Exact match short hallucinations and prompt echoes
+        # 2. Exact match short hallucinations and prompt echoes
         exact_list = {
             "конец", "the end", "подпишись", "подпишитесь", "subscribe", "дискласс", "дискор", "дискорд",
             "звучит музыка", "музыка", "аплодисменты", "тишина", "звук", "топ 5", "топ-5", "топ 10", "топ-10",
             "а-а-а", "ааа", "о-о-о", "ооо", "продолжение следует", "субтитры", "dimatorzok", "диматорзок",
             "semkin", "семкин", "пауза", "шум", "клики", "перевод", "редактор", "корректор",
             "голосовой чат", "голосовой чатеринка", "голос", "чат", "писк", "звонок", "discord",
+            "ну, а что, а", "ну а что а", "ну, а что", "ну а что", "звук салона", "звук сна",
+            "пищевую воду", "пищевая вода", "а, да", "а да", "а, да, да", "а да да", "угу, давай",
         }
         if lower in exact_list:
             return True
 
-        # Substring indicators of subtitle / video artifacts
+        # 3. Clause repetitions (split by commas/periods)
+        clauses = [re.sub(r'^(ну|а|и|да)\s+', '', s.strip()).strip() for s in re.split(r'[,.!?]+', lower) if len(s.strip()) > 3]
+        if len(clauses) >= 2 and len(clauses) != len(set(clauses)):
+            return True
+
+        # 4. N-gram repetition loop detection (e.g. 'да да да', 'я не знаю я не знаю')
+        words = [w.strip(".,!?\"'«»`") for w in lower.split() if w.strip(".,!?\"'«»`")]
+        if len(words) >= 3 and len(set(words)) == 1:
+            return True
+
+        # Single-word dominance in short transcripts
+        counts = collections.Counter(words)
+        if len(words) >= 5 and any(count >= 3 and (count / len(words)) >= 0.40 for count in counts.values()):
+            return True
+
+        for n in [2, 3, 4]:
+            if len(words) >= n * 2:
+                ngrams = [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
+                ngram_counts = collections.Counter(ngrams)
+                for ng, cnt in ngram_counts.items():
+                    if cnt >= 2 and n >= 3:
+                        return True
+                    if cnt >= 3 and n == 2:
+                        return True
+
+
+        # 5. Substring indicators of subtitle / video artifacts
         sub_patterns = [
             r"субтитр",
             r"dimatorzok",
@@ -457,15 +545,13 @@ class STTVoiceSink(AudioSinkBase):
             r"vk\.com",
             r"youtube\.com",
             r"голосовой чат",
+            r"пищевую воду",
+            r"звук салона",
+            r"звук сна",
         ]
         for pat in sub_patterns:
             if re.search(pat, lower):
                 return True
-
-        # Repetitive single word loop hallucination (e.g. "да да да да да", "а а а а")
-        words = lower.split()
-        if len(words) >= 4 and len(set(words)) == 1:
-            return True
 
         return False
 
@@ -497,13 +583,15 @@ class STTVoiceSink(AudioSinkBase):
         api_base = cfg.get("api_base", "http://localhost:20128/v1").rstrip("/")
         api_key = cfg.get("api_key", "omniroute")
         lang = cfg.get("language", "ru" if "ru" in self.language.lower() else "en")
-        preferred_model = cfg.get("model", "groq/whisper-large-v3")
+        preferred_model = cfg.get("model", "groq/whisper-large-v3-turbo")
 
         models_to_try = [preferred_model]
-        if "groq/whisper-large-v3" not in models_to_try:
-            models_to_try.append("groq/whisper-large-v3")
         if "groq/whisper-large-v3-turbo" not in models_to_try:
             models_to_try.append("groq/whisper-large-v3-turbo")
+        if "groq/whisper-large-v3" not in models_to_try:
+            models_to_try.append("groq/whisper-large-v3")
+
+        is_rejected_hallucination = False
 
         if provider in ["omniroute", "openai_compatible", "groq", "whisper"]:
             for model in models_to_try:
@@ -512,15 +600,48 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
                     form.add_field("model", model)
                     form.add_field("language", lang)
-                    form.add_field("temperature", "0")
+                    form.add_field("temperature", "0.0")
+                    form.add_field("response_format", "verbose_json")
+                    form.add_field("prompt", "Разговорная речь в голосовом чате Discord.")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
                     async with aiohttp.ClientSession() as session:
                         async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
-                                candidate = _clean_transcript_text(data.get("text", ""))
-                                if candidate and not self._is_whisper_hallucination(candidate):
+                                raw_text = data.get("text", "")
+                                segments = data.get("segments") or []
+
+                                # Confidence & Hallucination Gating on Whisper verbose metadata
+                                is_hallucination = False
+                                reject_reasons = []
+
+                                if segments:
+                                    avg_no_speech = sum(s.get("no_speech_prob", 0.0) for s in segments) / len(segments)
+                                    max_no_speech = max(s.get("no_speech_prob", 0.0) for s in segments)
+                                    avg_logprob = sum(s.get("avg_logprob", 0.0) for s in segments) / len(segments)
+                                    max_compression = max(s.get("compression_ratio", 1.0) for s in segments)
+
+                                    if avg_no_speech > 0.45 or max_no_speech > 0.65:
+                                        is_hallucination = True
+                                        reject_reasons.append(f"no_speech_prob (avg {avg_no_speech:.2f}, max {max_no_speech:.2f})")
+                                    if avg_logprob < -0.90:
+                                        is_hallucination = True
+                                        reject_reasons.append(f"low logprob ({avg_logprob:.2f})")
+                                    if max_compression > 2.2:
+                                        is_hallucination = True
+                                        reject_reasons.append(f"high compression_ratio ({max_compression:.2f})")
+
+                                candidate = _clean_transcript_text(raw_text)
+                                if not candidate or self._is_whisper_hallucination(candidate):
+                                    is_hallucination = True
+                                    reject_reasons.append("pattern/loop filter")
+
+                                if is_hallucination:
+                                    is_rejected_hallucination = True
+                                    with open(dbg_log, "a") as f:
+                                        f.write(f"[{datetime.now()}] 🛡️ [STT REJECT] Filtered hallucination '{raw_text.strip()}' for {username} ({', '.join(reject_reasons)})\n")
+                                else:
                                     text = candidate
                                     with open(dbg_log, "a") as f:
                                         f.write(f"[{datetime.now()}] 🎯 [STT RESULT] Whisper ({model}) for {username}: '{text}'\n")
@@ -533,8 +654,8 @@ class STTVoiceSink(AudioSinkBase):
                     with open(dbg_log, "a") as f:
                         f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) error: {e}, trying fallback...\n")
 
-        # Fallback to Google Web Speech API
-        if not text:
+        # Fallback to Google Web Speech API only if Whisper errored out (not when rejected as noise)
+        if not text and not is_rejected_hallucination:
             def _google_transcribe():
                 try:
                     r = sr.Recognizer()
@@ -571,6 +692,7 @@ class STTVoiceSink(AudioSinkBase):
                 except Exception as cb_err:
                     with open(dbg_log, "a") as f:
                         f.write(f"[{datetime.now()}] ❌ Transcript callback error: {cb_err}\n")
+
 
     def _drop_user(self, uid: int) -> None:
         self._user_buffers.pop(uid, None)
@@ -796,8 +918,10 @@ class DiscordWorkspace(Workspace):
                 "provider": "omniroute",
                 "api_base": "http://localhost:20128/v1",
                 "api_key": "omniroute",
-                "model": "groq/whisper-large-v3",
-                "language": "ru"
+                "model": "groq/whisper-large-v3-turbo",
+                "language": "ru",
+                "vad_mode": 2,
+                "min_energy": 600
             }
             self._save_stt_config()
 
@@ -2811,13 +2935,15 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.voice.stt_configure",
-        description="Configure Speech-to-Text (STT) Whisper API endpoint (OmniRoute, Groq, OpenAI, or local Whisper)",
+        description="Configure Speech-to-Text (STT) Whisper API endpoint and VAD sensitivity",
         arguments={
             "provider": {"type": "string", "description": "STT Provider: 'omniroute', 'openai_compatible', 'groq', 'google'", "default": "omniroute"},
             "api_base": {"type": "string", "description": "OpenAI-compatible Whisper API base URL (default: 'http://localhost:20128/v1')", "default": "http://localhost:20128/v1"},
             "api_key": {"type": "string", "description": "API Key for Whisper service", "default": "omniroute"},
             "model": {"type": "string", "description": "Whisper Model ID (e.g. 'groq/whisper-large-v3-turbo', 'groq/whisper-large-v3', 'whisper-1')", "default": "groq/whisper-large-v3-turbo"},
-            "language": {"type": "string", "description": "Default language code ('ru', 'en')", "default": "ru"}
+            "language": {"type": "string", "description": "Default language code ('ru', 'en')", "default": "ru"},
+            "vad_mode": {"type": "integer", "description": "WebRTC VAD aggressiveness mode (0 = least aggressive, 3 = most aggressive)", "default": 2},
+            "min_energy": {"type": "integer", "description": "Minimum audio RMS energy for speech gate", "default": 600}
         },
     )
     async def voice_stt_configure(
@@ -2827,6 +2953,8 @@ class DiscordWorkspace(Workspace):
         api_key: str = "omniroute",
         model: str = "groq/whisper-large-v3-turbo",
         language: str = "ru",
+        vad_mode: int = 2,
+        min_energy: int = 600,
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         self._stt_config = {
@@ -2835,12 +2963,14 @@ class DiscordWorkspace(Workspace):
             "api_key": api_key.strip(),
             "model": model.strip(),
             "language": language.strip(),
+            "vad_mode": int(vad_mode),
+            "min_energy": int(min_energy),
         }
         self._save_stt_config()
         return {
             "configured": True,
             "stt_config": self._stt_config,
-            "info": f"STT configured successfully to use provider '{provider}' with model '{model}' at '{api_base}'.",
+            "info": f"STT configured successfully to use provider '{provider}' with model '{model}' at '{api_base}' (VAD mode={vad_mode}, min_energy={min_energy}).",
         }
 
     @tool(
