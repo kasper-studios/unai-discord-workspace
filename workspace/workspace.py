@@ -732,17 +732,10 @@ class VoiceManager:
                 client = discord.Client()
 
             clean_token = token.replace("Bot ", "").strip()
-            is_bot = token.startswith("Bot ")
-
-            ready_event = asyncio.Event()
-
-            @client.event
-            async def on_ready():
-                ready_event.set()
-
-            asyncio.create_task(client.start(clean_token))
+            await client.login(clean_token)
+            asyncio.create_task(client.connect())
             try:
-                await asyncio.wait_for(ready_event.wait(), timeout=8.0)
+                await asyncio.wait_for(client.wait_until_ready(), timeout=12.0)
             except Exception:
                 pass
             self._py_client = client
@@ -790,10 +783,14 @@ class VoiceManager:
         vc = await self.get_or_connect(token, channel_id_str)
         gid = vc.guild.id
 
+        if hasattr(vc, "stop_listening"):
+            try:
+                vc.stop_listening()
+            except Exception:
+                pass
+
         if gid in self._active_sinks:
             try:
-                if hasattr(vc, "stop_listening"):
-                    vc.stop_listening()
                 self._active_sinks[gid].cleanup()
             except Exception:
                 pass
@@ -801,7 +798,17 @@ class VoiceManager:
         client_loop = getattr(self._py_client, "loop", None) or asyncio.get_event_loop()
         sink = STTVoiceSink(callback=on_transcript_cb, language=language, stt_config=stt_config, loop=client_loop)
         if hasattr(vc, "listen"):
-            vc.listen(sink)
+            try:
+                vc.listen(sink)
+            except Exception as listen_err:
+                try:
+                    dbg_log = _get_data_dir() / "voice_debug.log"
+                    with open(dbg_log, "a") as f:
+                        f.write(f"[{datetime.now()}] ❌ [LISTEN ERROR] Failed to attach sink: {listen_err}\n")
+                except Exception:
+                    pass
+                raise
+
         self._active_sinks[gid] = sink
         try:
             dbg_log = _get_data_dir() / "voice_debug.log"
@@ -809,6 +816,7 @@ class VoiceManager:
                 f.write(f"[{datetime.now()}] 🎧 [LISTEN START] Voice listener attached to '{vc.channel.name}' in '{vc.guild.name}'. STT Model: {stt_config.get('model', 'default') if stt_config else 'default'}\n")
         except Exception:
             pass
+
 
         return {
             "channel_id": str(vc.channel.id),
