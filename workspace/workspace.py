@@ -151,9 +151,21 @@ try:
 
         return _orig_decode_packet(self, packet)
 
-    _vr_router.PacketDecoder._decode_packet = _dave_aware_decode_packet
+    # Prevent single packet or decrypt glitches from stopping the AudioReader listener thread
+    _orig_reader_callback = _vr_reader.AudioReader.callback
+
+    def _safe_reader_callback(self, packet_data: bytes) -> None:
+        try:
+            _orig_reader_callback(self, packet_data)
+        except Exception:
+            pass
+        finally:
+            self.error = None
+
+    _vr_reader.AudioReader.callback = _safe_reader_callback
 
     AudioSinkBase = voice_recv.AudioSink
+
 except Exception:
     try:
         from discord.ext import voice_recv
@@ -489,17 +501,26 @@ class STTVoiceSink(AudioSinkBase):
         if self._inactivity_task is None and self.loop and self.loop.is_running() and self._running:
             self._inactivity_task = self.loop.create_task(self._inactivity_loop())
 
-        if uid not in self._user_buffers:
-            vad_mode = int(self.stt_config.get("vad_mode", 1))
-            min_energy = int(self.stt_config.get("min_energy", 250))
-            self._user_buffers[uid] = UserVoiceBuffer(uid=uid, uname=uname, vad_mode=vad_mode, min_energy=min_energy)
+        try:
+            if uid not in self._user_buffers:
+                vad_mode = int(self.stt_config.get("vad_mode", 1))
+                min_energy = int(self.stt_config.get("min_energy", 250))
+                self._user_buffers[uid] = UserVoiceBuffer(uid=uid, uname=uname, vad_mode=vad_mode, min_energy=min_energy)
 
-        user_buf = self._user_buffers[uid]
-        res = user_buf.process_frame(pcm_bytes)
-        if res:
-            raw_pcm, dur, avg_rms = res
-            if self.loop and self.loop.is_running():
-                asyncio.run_coroutine_threadsafe(self._process_stt_raw_pcm(uid, uinfo, raw_pcm, dur, avg_rms), self.loop)
+            user_buf = self._user_buffers[uid]
+            res = user_buf.process_frame(pcm_bytes)
+            if res:
+                raw_pcm, dur, avg_rms = res
+                if self.loop and self.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(self._process_stt_raw_pcm(uid, uinfo, raw_pcm, dur, avg_rms), self.loop)
+        except Exception as write_err:
+            try:
+                dbg_log = _get_data_dir() / "voice_debug.log"
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] ⚠️ [WRITE ERR] {write_err}\n")
+            except Exception:
+                pass
+
 
     async def _inactivity_loop(self) -> None:
         """Check for speakers who paused and Discord stopped sending UDP packets (DTX)."""
