@@ -690,10 +690,18 @@ class STTVoiceSink(AudioSinkBase):
         preferred_model = cfg.get("model", "groq/whisper-large-v3-turbo")
 
         models_to_try = [preferred_model]
-        if "groq/whisper-large-v3-turbo" not in models_to_try:
-            models_to_try.append("groq/whisper-large-v3-turbo")
-        if "groq/whisper-large-v3" not in models_to_try:
-            models_to_try.append("groq/whisper-large-v3")
+        candidates = [
+            "groq/whisper-large-v3-turbo",
+            "groq/whisper-large-v3",
+            "whisper-large-v3-turbo",
+            "whisper-large-v3",
+            "whisper-1",
+            "openai/whisper-1",
+            "cloudflare/@cf/openai/whisper",
+        ]
+        for c in candidates:
+            if c not in models_to_try:
+                models_to_try.append(c)
 
         is_rejected_hallucination = False
 
@@ -708,9 +716,8 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("response_format", "verbose_json")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-
                     async with aiohttp.ClientSession() as session:
-                        async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                        async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 raw_text = data.get("text", "")
@@ -753,10 +760,11 @@ class STTVoiceSink(AudioSinkBase):
                             else:
                                 err_body = await resp.text()
                                 with open(dbg_log, "a") as f:
-                                    f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) status {resp.status}: {err_body[:120]}, trying fallback...\n")
+                                    f.write(f"[{datetime.now()}] ⚠️ [STT FAILOVER] Whisper ({model}) returned status {resp.status}: {err_body[:100]}, failing over to next model...\n")
                 except Exception as e:
                     with open(dbg_log, "a") as f:
-                        f.write(f"[{datetime.now()}] ⚠️ Whisper ({model}) error: {e}, trying fallback...\n")
+                        f.write(f"[{datetime.now()}] ⚠️ [STT FAILOVER] Whisper ({model}) request error: {e}, failing over to next model...\n")
+
 
         # Fallback to Google Web Speech API only if Whisper errored out (not when rejected as noise)
         if not text and not is_rejected_hallucination:
