@@ -131,14 +131,20 @@ try:
                 user_id = getattr(self, '_cached_id', None) or (vc._get_id_from_ssrc(self.ssrc) if hasattr(vc, '_get_id_from_ssrc') else None) or 0
                 if dave_session and getattr(dave_session, 'ready', False) and user_id:
                     try:
-                        decrypted = dave_session.decrypt(davey.MediaType.audio, user_id, packet.decrypted_data)
+                        decrypted = dave_session.decrypt(user_id, davey.MediaType.audio, packet.decrypted_data)
                         if decrypted:
                             packet.decrypted_data = decrypted
-                    except Exception:
-                        pass
+                    except Exception as dave_err:
+                        try:
+                            dbg_log = _get_data_dir() / "voice_debug.log"
+                            with open(dbg_log, "a") as f:
+                                f.write(f"[{datetime.now()}] ⚠️ [DAVE DECRYPT ERR] uid {user_id}: {dave_err}\n")
+                        except Exception:
+                            pass
         return _orig_decode_packet(self, packet)
 
     _vr_router.PacketDecoder._decode_packet = _dave_aware_decode_packet
+
     AudioSinkBase = voice_recv.AudioSink
 except Exception:
     try:
@@ -280,22 +286,34 @@ class UserVoiceBuffer:
                 is_vad_active = False
 
         # Dynamic speech threshold based on user's background noise
-        dynamic_thresh = max(self.min_energy, self.noise_floor_rms * 1.25)
+        dynamic_thresh = max(self.min_energy, self.noise_floor_rms * 1.15)
         has_enough_energy = frame_rms >= dynamic_thresh
 
-        # Human speech rarely has ZCR > 0.38 (typical is 0.05 - 0.25; static/hiss is ~0.45 - 0.55)
-        not_white_noise = zcr <= 0.38
+        # Human speech rarely has ZCR > 0.45 (typical is 0.05 - 0.35; static/hiss is ~0.50 - 0.60)
+        not_white_noise = zcr <= 0.45
 
         if self._vad:
             is_speech = is_vad_active and has_enough_energy and not_white_noise
         else:
-            is_speech = has_enough_energy and not_white_noise and (frame_rms >= self.noise_floor_rms * 1.5)
+            is_speech = has_enough_energy and not_white_noise and (frame_rms >= self.noise_floor_rms * 1.3)
 
         if not is_speech and frame_rms > 50:
             # Update ambient noise floor with slow exponential moving average
             self.noise_floor_rms = 0.96 * self.noise_floor_rms + 0.04 * frame_rms
 
+        if not hasattr(self, '_total_frame_cnt'):
+            self._total_frame_cnt = 0
+        self._total_frame_cnt += 1
+        if self._total_frame_cnt <= 3 or self._total_frame_cnt % 100 == 0:
+            try:
+                dbg_log = _get_data_dir() / "voice_debug.log"
+                with open(dbg_log, "a") as f:
+                    f.write(f"[{datetime.now()}] 📊 [VAD FRAME #{self._total_frame_cnt}] {self.uname}: RMS={int(frame_rms)}, thresh={int(dynamic_thresh)}, vad={is_vad_active}, zcr={zcr:.2f}, speech={is_speech}\n")
+            except Exception:
+                pass
+
         return is_speech, frame_rms, zcr
+
 
     def process_frame(self, pcm_bytes: bytes) -> Optional[Tuple[bytes, float, float]]:
         """Process incoming 20ms frame. Returns (raw_pcm, duration_sec, avg_rms) if phrase completed."""
