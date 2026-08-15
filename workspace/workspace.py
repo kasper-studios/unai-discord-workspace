@@ -89,41 +89,9 @@ try:
         lib = find_library("opus")
         if lib:
             discord.opus.load_opus(lib)
-    if hasattr(discord.opus, "Decoder"):
-        import ctypes, array
-        def _safe_opus_decode(self, data, *, fec=False):
-            channel_count = self.CHANNELS
-            max_frame_size = 5760  # 120ms buffer capacity at 48kHz
-            pcm = (ctypes.c_int16 * (max_frame_size * channel_count))()
-            pcm_ptr = ctypes.cast(pcm, discord.opus.c_int16_ptr)
-
-            if not data:
-                try:
-                    ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
-                    if ret > 0:
-                        return array.array('h', pcm[: ret * channel_count]).tobytes()
-                except Exception:
-                    pass
-                return b'\x00' * 3840
-
-            try:
-                ret = discord.opus._lib.opus_decode(self._state, data, len(data), pcm_ptr, max_frame_size, 1 if fec else 0)
-                if ret > 0:
-                    return array.array('h', pcm[: ret * channel_count]).tobytes()
-            except Exception:
-                pass
-
-            try:
-                ret = discord.opus._lib.opus_decode(self._state, None, 0, pcm_ptr, 960, 0)
-                if ret > 0:
-                    return array.array('h', pcm[: ret * channel_count]).tobytes()
-            except Exception:
-                pass
-            return b'\x00' * 3840
-
-        discord.opus.Decoder.decode = _safe_opus_decode
 except Exception:
     pass
+
 
 try:
     from discord.ext import voice_recv
@@ -225,7 +193,7 @@ class UserVoiceBuffer:
         self._vad = webrtcvad.Vad(vad_mode) if webrtcvad else None
         self.noise_floor_rms: float = 600.0
         self.min_energy = min_energy
-        self.pre_buffer: collections.deque = collections.deque(maxlen=15)  # ~300ms pre-speech ring buffer
+        self.pre_buffer: collections.deque = collections.deque(maxlen=20)  # ~400ms pre-speech ring buffer
         self.phrase_frames: List[bytes] = []
         self.is_speaking: bool = False
         self.consecutive_speech_frames: int = 0
@@ -292,8 +260,8 @@ class UserVoiceBuffer:
         if not self.is_speaking:
             if is_speech:
                 self.consecutive_speech_frames += 1
-                # Require 4 consecutive speech frames (~80ms) to trigger phrase start
-                if self.consecutive_speech_frames >= 4:
+                # Require 3 consecutive speech frames (~60ms) to trigger phrase start
+                if self.consecutive_speech_frames >= 3:
                     self.is_speaking = True
                     self.phrase_start_time = now
                     self.phrase_frames = list(self.pre_buffer) + [pcm_bytes]
@@ -315,17 +283,17 @@ class UserVoiceBuffer:
         else:
             self.silence_frame_count += 1
 
-        # End of phrase condition 1: ~400ms (20 frames) of silence pause
-        if self.silence_frame_count >= 20:
+        # End of phrase condition 1: ~700ms (35 frames) of natural pause silence
+        if self.silence_frame_count >= 35:
             return self._flush_phrase()
 
-        # End of phrase condition 2: max phrase duration ~8.0s (400 frames)
-        if len(self.phrase_frames) >= 400:
+        # End of phrase condition 2: max phrase duration ~15.0s (750 frames)
+        if len(self.phrase_frames) >= 750:
             return self._flush_phrase()
 
         return None
 
-    def flush_if_timed_out(self, now: float, timeout: float = 0.50) -> Optional[Tuple[bytes, float, float]]:
+    def flush_if_timed_out(self, now: float, timeout: float = 0.75) -> Optional[Tuple[bytes, float, float]]:
         """Called by periodic inactivity monitor when Discord stops sending UDP packets."""
         if self.is_speaking and (now - self.last_packet_time >= timeout):
             return self._flush_phrase()
@@ -354,15 +322,16 @@ class UserVoiceBuffer:
         voiced_ratio = voiced_cnt / max(1, total_frames)
 
         # Stricter phrase validation to reject noise clicks & hum:
-        # - Duration must be >= 0.7s
-        # - Must contain at least 12 voiced frames (~240ms of verified speech)
-        # - Voiced frame ratio must be >= 25%
+        # - Duration must be >= 0.5s
+        # - Must contain at least 8 voiced frames (~160ms of verified speech)
+        # - Voiced frame ratio must be >= 20%
         # - Average speech RMS must be above dynamic noise floor
-        if duration_sec < 0.7 or voiced_cnt < 12 or voiced_ratio < 0.25 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.15):
+        if duration_sec < 0.5 or voiced_cnt < 8 or voiced_ratio < 0.20 or avg_rms < max(self.min_energy, self.noise_floor_rms * 1.15):
             return None
 
         raw_pcm = b"".join(frames)
         return (raw_pcm, duration_sec, avg_rms)
+
 
 
 class STTVoiceSink(AudioSinkBase):
@@ -602,8 +571,8 @@ class STTVoiceSink(AudioSinkBase):
                     form.add_field("language", lang)
                     form.add_field("temperature", "0.0")
                     form.add_field("response_format", "verbose_json")
-                    form.add_field("prompt", "Разговорная речь в голосовом чате Discord.")
                     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
 
                     async with aiohttp.ClientSession() as session:
                         async with session.post(f"{api_base}/audio/transcriptions", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=12)) as resp:
