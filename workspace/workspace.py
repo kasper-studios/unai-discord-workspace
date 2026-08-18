@@ -3502,7 +3502,7 @@ class DiscordWorkspace(Workspace):
                 )
             },
             "deliver": {"type": "string", "description": "Delivery target: 'log', 'telegram', 'discord'", "default": "log"},
-            "hermes_port": {"type": "integer", "description": "Port of Hermes webhook daemon (default 8644)", "default": 8644},
+            "hermes_port": {"type": "integer", "description": "Port of Hermes Chat Webhook daemon (default 8766)", "default": 8766},
             "auto_trigger": {"type": "boolean", "description": "Enable auto HTTP POSTing payloads to Hermes webhook when new messages arrive", "default": True}
         },
     )
@@ -3517,7 +3517,7 @@ class DiscordWorkspace(Workspace):
         max_unread_history: int = 10,
         prompt: Optional[str] = None,
         deliver: str = "log",
-        hermes_port: int = 8644,
+        hermes_port: int = 8766,
         auto_trigger: bool = True,
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -3571,7 +3571,7 @@ class DiscordWorkspace(Workspace):
         except Exception as e:
             sub_output = f"Hermes CLI call error: {e}"
 
-        target_url = f"http://127.0.0.1:{hermes_port}/webhooks/{route_name}"
+        target_url = f"http://127.0.0.1:{hermes_port}/webhook/{route_name}"
         if auto_trigger:
             self._hermes_webhook_url = target_url
 
