@@ -35,6 +35,14 @@ except ImportError:
 
 from unai.sdk import Workspace, tool
 
+try:
+    from voice_engine import VoiceEngine
+except ImportError:
+    try:
+        from .voice_engine import VoiceEngine
+    except ImportError:
+        VoiceEngine = None
+
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
@@ -935,11 +943,105 @@ class DiscordWorkspace(Workspace):
         self._stt_config: Dict[str, Any] = {}
         self._active_tracks: Dict[int, Dict[str, Any]] = {}
         self._hermes_webhook_url: Optional[str] = None
+        self._hermes_wake_words: List[str] = ["диром", "dirom"]
+        self._hermes_always_trigger_dm: bool = True
+        self._hermes_trigger_on_reply: bool = True
+        self._hermes_trigger_on_mention: bool = True
+        self._hermes_max_unread_history: int = 10
+        self._voice_engine: Optional[Any] = None
         self._load_saved_token()
         self._load_notifications_cache()
         self._load_voice_transcripts_cache()
         self._load_music_config()
         self._load_stt_config()
+
+    def _get_voice_engine(self) -> Any:
+        if self._voice_engine is None:
+            if VoiceEngine is None:
+                raise RuntimeError("VoiceEngine could not be loaded. Ensure voice_engine.py is present.")
+            self._voice_engine = VoiceEngine()
+        return self._voice_engine
+
+    async def _send_voice_note(
+        self,
+        channel_id: str,
+        ogg_path: Path,
+        duration_secs: float,
+        waveform_b64: str,
+        reply_to: str = "",
+    ) -> Dict[str, Any]:
+        """Sends an Opus .ogg voice message as a native Discord Voice Note (гска) with waveform."""
+        payload: Dict[str, Any] = {
+            "flags": 8192,
+            "attachments": [
+                {
+                    "id": 0,
+                    "filename": ogg_path.name,
+                    "duration_secs": round(duration_secs, 2),
+                    "waveform": waveform_b64,
+                }
+            ],
+        }
+        if reply_to:
+            payload["message_reference"] = {"message_id": str(reply_to).strip()}
+
+        # Primary method: Direct multipart upload
+        try:
+            data = aiohttp.FormData()
+            data.add_field("payload_json", json.dumps(payload))
+            data.add_field(
+                "files[0]",
+                ogg_path.read_bytes(),
+                filename=ogg_path.name,
+                content_type="audio/ogg",
+            )
+            return await self._api_request("POST", f"/channels/{channel_id}/messages", data=data)
+        except Exception as direct_err:
+            # Fallback method: /attachments endpoint upload URL
+            try:
+                raw_data = ogg_path.read_bytes()
+                upload_req = {
+                    "files": [
+                        {
+                            "filename": ogg_path.name,
+                            "file_size": len(raw_data),
+                            "id": 0,
+                        }
+                    ]
+                }
+                att_resp = await self._api_request("POST", f"/channels/{channel_id}/attachments", json_data=upload_req)
+                attachments_meta = att_resp.get("attachments", [])
+                if not attachments_meta:
+                    raise direct_err
+
+                upload_info = attachments_meta[0]
+                upload_url = upload_info["upload_url"]
+                upload_filename = upload_info["upload_filename"]
+
+                headers = {"Content-Type": "audio/ogg"}
+                async with aiohttp.ClientSession() as session:
+                    async with session.put(upload_url, data=raw_data, headers=headers) as put_resp:
+                        if put_resp.status not in (200, 201, 204):
+                            raise RuntimeError(f"Voice upload failed with status {put_resp.status}")
+
+                msg_payload = {
+                    "flags": 8192,
+                    "attachments": [
+                        {
+                            "id": "0",
+                            "filename": ogg_path.name,
+                            "uploaded_filename": upload_filename,
+                            "duration_secs": round(duration_secs, 2),
+                            "waveform": waveform_b64,
+                        }
+                    ],
+                }
+                if reply_to:
+                    msg_payload["message_reference"] = {"message_id": str(reply_to).strip()}
+
+                return await self._api_request("POST", f"/channels/{channel_id}/messages", json_data=msg_payload)
+            except Exception:
+                raise direct_err
 
     def _load_music_config(self) -> None:
         mf = _get_data_dir() / "music_config.json"
@@ -988,20 +1090,113 @@ class DiscordWorkspace(Workspace):
         if not self._hermes_webhook_url:
             return
 
+        channel_id = str(notif.get("channel_id") or "")
+        guild_id = notif.get("guild_id") or ""
+        is_dm = not bool(guild_id)
+        msg_id = str(notif.get("id") or notif.get("message_id") or "")
+        content = str(notif.get("content") or notif.get("text") or "")
+        
+        author_obj = notif.get("author") or {}
+        author_name = author_obj.get("username") if isinstance(author_obj, dict) else str(author_obj)
+        author_username = author_name
+        author_id = str(notif.get("author_id") or notif.get("user_id") or "")
+        reply_to_is_self = bool(notif.get("reply_to_is_self", False))
+
+        should_wake = False
+        trigger_reason = ""
+
+        if not self._hermes_wake_words:
+            should_wake = True
+            trigger_reason = "Любое входящее сообщение (wake_words отключены)"
+        else:
+            if self._hermes_always_trigger_dm and is_dm:
+                should_wake = True
+                trigger_reason = "Личное сообщение (DM)"
+            elif self._hermes_trigger_on_reply and reply_to_is_self:
+                should_wake = True
+                trigger_reason = "Ответ на сообщение бота"
+            else:
+                my_id = str((self._user_info or {}).get("id") or "")
+                my_username = (self._user_info or {}).get("username", "").lower()
+                if self._hermes_trigger_on_mention and my_id and f"<@{my_id}>" in content:
+                    should_wake = True
+                    trigger_reason = f"Упоминание <@{my_id}>"
+                elif self._hermes_trigger_on_mention and my_username and f"@{my_username}" in content.lower():
+                    should_wake = True
+                    trigger_reason = f"Упоминание @{my_username}"
+
+            if not should_wake:
+                content_lower = content.lower()
+                for w in self._hermes_wake_words:
+                    if w and w in content_lower:
+                        should_wake = True
+                        trigger_reason = f"Слово активации '{w}'"
+                        break
+
+        # If condition not met, leave in unread cache and do not wake Hermes
+        if not should_wake:
+            return
+
+        # Collect unread previous messages for this channel as missed context
+        unread_items = [
+            n for n in self._notifications_cache
+            if str(n.get("channel_id")) == channel_id and not n.get("read") and str(n.get("id")) != str(msg_id)
+        ]
+        unread_items = unread_items[:self._hermes_max_unread_history]
+        unread_items.reverse()
+
+        missed_context_formatted = ""
+        if unread_items:
+            missed_lines = []
+            for item in unread_items:
+                u_author = item.get("author") or item.get("username") or "user"
+                u_text = item.get("content") or item.get("text") or ""
+                u_mid = item.get("id") or item.get("message_id") or ""
+                missed_lines.append(f"- @{u_author} (id: {u_mid}): {u_text}")
+            missed_context_formatted = "\n[Пропущенные непрочитанные сообщения в этом канале]:\n" + "\n".join(missed_lines)
+
+        # Mark processed notifications as read
+        for item in unread_items:
+            item["read"] = True
+        notif["read"] = True
+        self._save_notifications_cache()
+
+        # Format reply context cleanly
+        reply_context = "Нет"
+        reply_info = notif.get("reply_to")
+        if isinstance(reply_info, dict) and reply_info:
+            r_user = reply_info.get("author_username") or "кто-то"
+            r_text = (reply_info.get("content") or "")[:120]
+            is_self_tag = " (это сообщение бота)" if reply_info.get("is_self") else ""
+            reply_context = f"id={reply_info.get('message_id')}, от @{r_user}{is_self_tag}: '{r_text}'"
+        elif notif.get("reply_to_content"):
+            reply_context = f"id={notif.get('reply_to_message_id')}, от @{notif.get('reply_to_author')}: '{str(notif.get('reply_to_content'))[:120]}'"
+
+        # Format attachments info
+        att_count = notif.get("attachments_count") or len(notif.get("attachments", []))
+        att_info = f"{att_count} шт." if att_count else "нет"
+
         async def _send():
             try:
+                payload = {
+                    "event_type": notif.get("type", "message"),
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "message_id": msg_id,
+                    "author": author_name,
+                    "author_name": author_name,
+                    "author_username": author_username,
+                    "author_id": author_id,
+                    "trigger_reason": trigger_reason,
+                    "reply_context": reply_context,
+                    "content": content,
+                    "text": content,
+                    "attachments_info": att_info,
+                    "missed_context_formatted": missed_context_formatted,
+                    "missed_messages_count": len(unread_items),
+                    "payload": notif,
+                }
                 async with aiohttp.ClientSession() as session:
-                    author_obj = notif.get("author") or {}
-                    author_name = author_obj.get("username") if isinstance(author_obj, dict) else str(author_obj)
-                    payload = {
-                        "author": author_name,
-                        "from": author_name,
-                        "channel_id": notif.get("channel_id"),
-                        "guild_id": notif.get("guild_id"),
-                        "content": notif.get("content") or notif.get("text"),
-                        "text": notif.get("content") or notif.get("text"),
-                        "payload": notif,
-                    }
                     await session.post(self._hermes_webhook_url, json=payload, timeout=5)
             except Exception:
                 pass
@@ -1244,6 +1439,22 @@ class DiscordWorkspace(Workspace):
                                         is_mentioned = any(m.get("id") == my_id for m in mentions) if my_id else False
 
                                         notif_type = "dm" if is_dm else ("mention" if is_mentioned else "message")
+
+                                        referenced_msg = d.get("referenced_message")
+                                        reply_info = None
+                                        if isinstance(referenced_msg, dict):
+                                            ref_author = referenced_msg.get("author", {})
+                                            ref_author_id = str(ref_author.get("id") or "")
+                                            reply_info = {
+                                                "message_id": referenced_msg.get("id"),
+                                                "author_id": ref_author_id,
+                                                "author_username": ref_author.get("username"),
+                                                "author_global_name": ref_author.get("global_name"),
+                                                "content": referenced_msg.get("content", ""),
+                                                "is_bot": ref_author.get("bot", False),
+                                                "is_self": bool(my_id and str(my_id) == ref_author_id),
+                                            }
+
                                         notif = {
                                             "id": d.get("id"),
                                             "type": notif_type,
@@ -1253,6 +1464,11 @@ class DiscordWorkspace(Workspace):
                                             "author_global_name": author.get("global_name"),
                                             "author_id": author_id,
                                             "content": d.get("content", ""),
+                                            "reply_to": reply_info,
+                                            "reply_to_message_id": reply_info.get("message_id") if reply_info else None,
+                                            "reply_to_author": reply_info.get("author_username") if reply_info else None,
+                                            "reply_to_content": reply_info.get("content") if reply_info else None,
+                                            "reply_to_is_self": reply_info.get("is_self") if reply_info else False,
                                             "timestamp": d.get("timestamp"),
                                             "attachments_count": len(d.get("attachments", [])),
                                             "read": False,
@@ -1816,6 +2032,39 @@ class DiscordWorkspace(Workspace):
             "content": res.get("content"),
             "timestamp": res.get("timestamp"),
             "info": "Message sent successfully",
+        }
+
+    @tool(
+        "discord.files.send_voice",
+        description="Upload and send an audio file as a native Discord Voice Note (гска) with waveform to a channel or DM",
+        arguments={
+            "channel_id": {"type": "string", "description": "Target text channel or DM ID"},
+            "file_path": {"type": "string", "description": "Local path to audio file (.ogg, .mp3, .wav, .flac, .m4a)"},
+            "reply_to": {"type": "string", "description": "Optional message ID to reply to", "default": ""}
+        },
+    )
+    async def files_send_voice(
+        self, channel_id: str, file_path: str, reply_to: str = "", reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        p = Path(file_path)
+        if not p.exists():
+            raise RuntimeError(f"Voice audio file not found: {file_path}")
+
+        engine = self._get_voice_engine()
+        ogg_path, duration, waveform = engine.convert_file_to_voice_ogg(p)
+        res = await self._send_voice_note(
+            channel_id=channel_id,
+            ogg_path=ogg_path,
+            duration_secs=duration,
+            waveform_b64=waveform,
+            reply_to=reply_to,
+        )
+        return {
+            "id": res.get("id"),
+            "channel_id": res.get("channel_id"),
+            "duration_seconds": round(duration, 2),
+            "file_path": str(ogg_path),
+            "info": f"Voice Note (гска) '{p.name}' sent successfully ({duration:.1f}s).",
         }
 
     @tool(
@@ -2537,14 +2786,15 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.voice.tts",
-        description="Speak text in a Discord Voice Channel using customizable neural TTS (voice, speed rate, pitch, volume)",
+        description="Speak text in a Discord Voice Channel using Voice Micro-DSL (SFX slices from ~/Media/Music, background music, audio effects, pitch, speed) or standard neural TTS",
         arguments={
             "channel_id": {"type": "string", "description": "Target Voice Channel ID or Guild ID"},
-            "text": {"type": "string", "description": "Text to synthesize and speak"},
+            "text": {"type": "string", "description": "Text to synthesize and speak, supports Micro-DSL tags like '{bg:phonk} {sfx:boom} {effect:robot} Привет!'"},
             "voice": {"type": "string", "description": "Neural voice name (e.g. 'ru-RU-DmitryNeural', 'ru-RU-SvetlanaNeural', 'en-US-GuyNeural')", "default": "ru-RU-DmitryNeural"},
             "rate": {"type": "string", "description": "Speed rate adjustment (e.g. '+0%', '+25%', '-15%')", "default": "+0%"},
             "pitch": {"type": "string", "description": "Pitch adjustment (e.g. '+0Hz', '+15Hz', '-20Hz')", "default": "+0Hz"},
-            "volume": {"type": "string", "description": "Volume adjustment (e.g. '+0%', '+30%')", "default": "+0%"}
+            "volume": {"type": "string", "description": "Volume adjustment (e.g. '+0%', '+30%')", "default": "+0%"},
+            "auto_mix": {"type": "boolean", "description": "Automatically mix background music and random SFX", "default": False}
         },
     )
     async def voice_tts(
@@ -2555,29 +2805,146 @@ class DiscordWorkspace(Workspace):
         rate: str = "+0%",
         pitch: str = "+0Hz",
         volume: str = "+0%",
+        auto_mix: bool = False,
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
-        import edge_tts
-        import tempfile
         if not text:
             raise RuntimeError("Text parameter is required for TTS synthesis.")
 
-        temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        temp_audio_path = temp_audio.name
-        temp_audio.close()
+        has_tags = bool(re.search(r"[\{\[][a-zA-Z0-9_\-]+(?::[^\]\}]+)?[\}\]]", text))
+        if has_tags or auto_mix:
+            engine = self._get_voice_engine()
+            ogg_path, duration, meta = await engine.render_to_ogg(
+                text=text, default_voice=voice, auto_mix=auto_mix
+            )
+            res = await self.voice_play_file(channel_id=channel_id, file_path=str(ogg_path))
+            res["meta"] = meta
+            res["duration_seconds"] = duration
+            return res
+        else:
+            import edge_tts
+            import tempfile
 
-        communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
-        await communicate.save(temp_audio_path)
+            temp_audio = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
+            temp_audio_path = temp_audio.name
+            temp_audio.close()
 
-        res = await self.voice_play_file(channel_id=channel_id, file_path=temp_audio_path)
-        res["tts_info"] = {
-            "text": text,
-            "voice": voice,
-            "rate": rate,
-            "pitch": pitch,
-            "volume": volume,
+            communicate = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch, volume=volume)
+            await communicate.save(temp_audio_path)
+
+            res = await self.voice_play_file(channel_id=channel_id, file_path=temp_audio_path)
+            res["tts_info"] = {
+                "text": text,
+                "voice": voice,
+                "rate": rate,
+                "pitch": pitch,
+                "volume": volume,
+            }
+            return res
+
+    # Voice Synthesis & Micro-DSL Voice Note (ГСки) Tools
+
+    @tool(
+        "discord.voice.send",
+        description="Synthesize speech with Voice Micro-DSL (SFX timing slices from ~/Media/Music, background music ducking, speed/pitch/effects) and send directly as a native Discord Voice Note (гска) with waveform to a channel or DM",
+        arguments={
+            "channel_id": {"type": "string", "description": "Target text channel or DM ID"},
+            "text": {"type": "string", "description": "Text with Micro-DSL tags (e.g. '{bg:phonk} {sfx:boom} Привет {rate:+30%} мир!')"},
+            "voice": {"type": "string", "description": "Default TTS narrator voice (default 'ru-RU-DmitryNeural')", "default": "ru-RU-DmitryNeural"},
+            "auto_mix": {"type": "boolean", "description": "Automatically pick and mix background music and sound effects", "default": False},
+            "reply_to": {"type": "string", "description": "Optional message ID to reply to", "default": ""}
+        },
+    )
+    async def voice_send(
+        self,
+        channel_id: str,
+        text: str,
+        voice: str = "ru-RU-DmitryNeural",
+        auto_mix: bool = False,
+        reply_to: str = "",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not text:
+            raise RuntimeError("Text parameter is required for voice synthesis.")
+
+        engine = self._get_voice_engine()
+        ogg_path, duration, meta = await engine.render_to_ogg(
+            text=text, default_voice=voice, auto_mix=auto_mix
+        )
+
+        res = await self._send_voice_note(
+            channel_id=channel_id,
+            ogg_path=ogg_path,
+            duration_secs=duration,
+            waveform_b64=meta.get("waveform", ""),
+            reply_to=reply_to,
+        )
+
+        return {
+            "id": res.get("id"),
+            "channel_id": res.get("channel_id"),
+            "duration_seconds": duration,
+            "file_path": str(ogg_path),
+            "meta": meta,
+            "info": f"Voice note (гска) synthesized and sent successfully ({meta['duration_seconds']}s, bg: {meta['bg_music']}, sfx: {meta['sfx_used']}).",
         }
-        return res
+
+    @tool(
+        "discord.voice.render",
+        description="Synthesize Voice Micro-DSL to a local .ogg Opus file with waveform without sending to Discord (returns file path, duration, and metadata)",
+        arguments={
+            "text": {"type": "string", "description": "Text with Voice Micro-DSL tags to synthesize"},
+            "voice": {"type": "string", "description": "Default TTS voice (default 'ru-RU-DmitryNeural')", "default": "ru-RU-DmitryNeural"},
+            "auto_mix": {"type": "boolean", "description": "Automatically mix background music and random SFX", "default": False}
+        },
+    )
+    async def voice_render(
+        self, text: str, voice: str = "ru-RU-DmitryNeural", auto_mix: bool = False, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        engine = self._get_voice_engine()
+        ogg_path, duration, meta = await engine.render_to_ogg(
+            text=text, default_voice=voice, auto_mix=auto_mix
+        )
+        return {
+            "file_path": str(ogg_path),
+            "duration_seconds": duration,
+            "meta": meta,
+            "info": f"Rendered {duration}s voice audio file to {ogg_path}",
+        }
+
+    @tool(
+        "discord.voice.dsl_docs",
+        description="Get full reference documentation for the Voice Micro-DSL (tags, timing slice syntax, available voices, effects, and examples)",
+    )
+    async def voice_dsl_docs(self, reason: Optional[str] = None) -> Dict[str, Any]:
+        engine = self._get_voice_engine()
+        return engine.get_dsl_documentation()
+
+    @tool(
+        "discord.voice.list_media",
+        description="List and search sound effects and background music tracks indexed in ~/Media/Music",
+        arguments={
+            "query": {"type": "string", "description": "Optional search term to filter media", "default": ""},
+            "category": {"type": "string", "description": "Optional category filter: 'sfx', 'bg', or 'all'", "default": "all"},
+            "force_refresh": {"type": "boolean", "description": "Force rescanning ~/Media/Music from disk", "default": False}
+        },
+    )
+    async def voice_list_media(
+        self, query: str = "", category: str = "all", force_refresh: bool = False, reason: Optional[str] = None
+    ) -> Dict[str, Any]:
+        engine = self._get_voice_engine()
+        items = engine.media_lib.refresh(force=force_refresh)
+        if query:
+            clean_q = engine.media_lib._clean_str(query)
+            items = [i for i in items if clean_q in engine.media_lib._clean_str(i["name"])]
+        if category and category != "all":
+            items = [i for i in items if i["category"] == category]
+
+        return {
+            "total": len(items),
+            "media_dir": str(engine.media_lib.media_dir),
+            "items": items[:50],
+        }
 
     @tool(
         "discord.voice.stop",
@@ -3104,11 +3471,31 @@ class DiscordWorkspace(Workspace):
 
     @tool(
         "discord.webhook.subscribe_hermes",
-        description="Subscribe Hermes CLI to incoming Discord messages and automatically wake up Hermes via Hermes Webhook API",
+        description="Subscribe Hermes CLI to incoming Discord messages with wake-word filtering and unread context aggregation",
         arguments={
             "route_name": {"type": "string", "description": "Hermes webhook route name (e.g. 'discord-inbound')", "default": "discord-inbound"},
-            "prompt": {"type": "string", "description": "Prompt template with {payload...} fields", "default": "Новое сообщение в Discord от {payload.author}: {payload.content}"},
-            "deliver": {"type": "string", "description": "Delivery target: 'origin', 'log', 'telegram', 'discord'", "default": "origin"},
+            "wake_words": {"type": "string", "description": "Comma-separated wake words (e.g. 'диром, dirom'). If empty, triggers on all messages.", "default": "диром, dirom"},
+            "always_trigger_in_dm": {"type": "boolean", "description": "Always wake Hermes for direct 1-on-1 private messages without requiring wake word", "default": True},
+            "trigger_on_reply": {"type": "boolean", "description": "Wake Hermes when a user replies to the bot's message", "default": True},
+            "trigger_on_mention": {"type": "boolean", "description": "Wake Hermes when @bot or <@bot_id> is mentioned", "default": True},
+            "max_unread_history": {"type": "integer", "description": "Max number of unread missed messages from this channel to include as context on wake", "default": 10},
+            "prompt": {
+                "type": "string",
+                "description": "Prompt template with {payload...} fields",
+                "default": (
+                    "[Hermes Webhook: Входящее сообщение Discord]\n"
+                    "Сервер ID: {payload.guild_id}\n"
+                    "Канал ID: {payload.channel_id}\n"
+                    "От: {payload.author_name} (@{payload.author_username}, ID: {payload.author_id})\n"
+                    "ID сообщения: {payload.message_id}\n"
+                    "Причина активации: {payload.trigger_reason}\n"
+                    "Ответ на: {payload.reply_context}\n"
+                    "Текст: {payload.content}\n"
+                    "Вложения: {payload.attachments_info}\n"
+                    "{payload.missed_context_formatted}"
+                )
+            },
+            "deliver": {"type": "string", "description": "Delivery target: 'log', 'telegram', 'discord', 'origin'", "default": "log"},
             "hermes_port": {"type": "integer", "description": "Port of Hermes webhook daemon (default 8644)", "default": 8644},
             "auto_trigger": {"type": "boolean", "description": "Enable auto HTTP POSTing payloads to Hermes webhook when new messages arrive", "default": True}
         },
@@ -3116,14 +3503,45 @@ class DiscordWorkspace(Workspace):
     async def webhook_subscribe_hermes(
         self,
         route_name: str = "discord-inbound",
-        prompt: str = "Новое сообщение в Discord от {payload.author}: {payload.content}",
-        deliver: str = "origin",
+        wake_words: str = "диром, dirom",
+        always_trigger_in_dm: bool = True,
+        trigger_on_reply: bool = True,
+        trigger_on_mention: bool = True,
+        max_unread_history: int = 10,
+        prompt: Optional[str] = None,
+        deliver: str = "log",
         hermes_port: int = 8644,
         auto_trigger: bool = True,
         reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         import shutil
         import subprocess
+
+        # Parse wake words
+        if wake_words:
+            self._hermes_wake_words = [w.strip().lower() for w in wake_words.split(",") if w.strip()]
+        else:
+            self._hermes_wake_words = []
+
+        self._hermes_always_trigger_dm = bool(always_trigger_in_dm)
+        self._hermes_trigger_on_reply = bool(trigger_on_reply)
+        self._hermes_trigger_on_mention = bool(trigger_on_mention)
+        self._hermes_max_unread_history = max(1, int(max_unread_history))
+
+        if not prompt:
+            prompt = (
+                "[Hermes Webhook: Входящее сообщение Discord]\n"
+                "Сервер ID: {payload.guild_id}\n"
+                "Канал ID: {payload.channel_id}\n"
+                "От: {payload.author_name} (@{payload.author_username}, ID: {payload.author_id})\n"
+                "ID сообщения: {payload.message_id}\n"
+                "Причина активации: {payload.trigger_reason}\n"
+                "Ответ на: {payload.reply_context}\n"
+                "Текст: {payload.content}\n"
+                "Вложения: {payload.attachments_info}\n"
+                "{payload.missed_context_formatted}"
+            )
+
         hermes_bin = shutil.which("hermes") or "/home/kasperenok/.local/bin/hermes"
         cmd = [
             hermes_bin,
@@ -3150,8 +3568,13 @@ class DiscordWorkspace(Workspace):
         return {
             "route_name": route_name,
             "webhook_url": target_url,
+            "wake_words": self._hermes_wake_words,
+            "always_trigger_in_dm": self._hermes_always_trigger_dm,
+            "trigger_on_reply": self._hermes_trigger_on_reply,
+            "trigger_on_mention": self._hermes_trigger_on_mention,
+            "max_unread_history": self._hermes_max_unread_history,
             "auto_trigger_enabled": auto_trigger,
             "cli_command": " ".join(cmd),
             "cli_output": sub_output.strip(),
-            "info": f"Subscribed Hermes webhook route '{route_name}'. Auto-trigger URL: {target_url}",
+            "info": f"Subscribed Hermes webhook route '{route_name}'. Wake words: {self._hermes_wake_words or 'ALL'}. Auto-trigger URL: {target_url}",
         }
