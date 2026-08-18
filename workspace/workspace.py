@@ -948,6 +948,7 @@ class DiscordWorkspace(Workspace):
         self._hermes_trigger_on_reply: bool = True
         self._hermes_trigger_on_mention: bool = True
         self._hermes_max_unread_history: int = 10
+        self._hermes_secret: str = "unai-local-token"
         self._voice_engine: Optional[Any] = None
         self._load_saved_token()
         self._load_notifications_cache()
@@ -1196,8 +1197,12 @@ class DiscordWorkspace(Workspace):
                     "missed_messages_count": len(unread_items),
                     "payload": notif,
                 }
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Gitlab-Token": self._hermes_secret,
+                }
                 async with aiohttp.ClientSession() as session:
-                    await session.post(self._hermes_webhook_url, json=payload, timeout=5)
+                    await session.post(self._hermes_webhook_url, json=payload, headers=headers, timeout=5)
             except Exception:
                 pass
 
@@ -3475,27 +3480,28 @@ class DiscordWorkspace(Workspace):
         arguments={
             "route_name": {"type": "string", "description": "Hermes webhook route name (e.g. 'discord-inbound')", "default": "discord-inbound"},
             "wake_words": {"type": "string", "description": "Comma-separated wake words (e.g. 'диром, dirom'). If empty, triggers on all messages.", "default": "диром, dirom"},
+            "secret": {"type": "string", "description": "Shared auth secret token for Hermes webhook authentication", "default": "unai-local-token"},
             "always_trigger_in_dm": {"type": "boolean", "description": "Always wake Hermes for direct 1-on-1 private messages without requiring wake word", "default": True},
             "trigger_on_reply": {"type": "boolean", "description": "Wake Hermes when a user replies to the bot's message", "default": True},
             "trigger_on_mention": {"type": "boolean", "description": "Wake Hermes when @bot or <@bot_id> is mentioned", "default": True},
             "max_unread_history": {"type": "integer", "description": "Max number of unread missed messages from this channel to include as context on wake", "default": 10},
             "prompt": {
                 "type": "string",
-                "description": "Prompt template with {payload...} fields",
+                "description": "Prompt template with {field} placeholders (e.g. {channel_id}, {content}, {author_name})",
                 "default": (
                     "[Hermes Webhook: Входящее сообщение Discord]\n"
-                    "Сервер ID: {payload.guild_id}\n"
-                    "Канал ID: {payload.channel_id}\n"
-                    "От: {payload.author_name} (@{payload.author_username}, ID: {payload.author_id})\n"
-                    "ID сообщения: {payload.message_id}\n"
-                    "Причина активации: {payload.trigger_reason}\n"
-                    "Ответ на: {payload.reply_context}\n"
-                    "Текст: {payload.content}\n"
-                    "Вложения: {payload.attachments_info}\n"
-                    "{payload.missed_context_formatted}"
+                    "Сервер ID: {guild_id}\n"
+                    "Канал ID: {channel_id}\n"
+                    "От: {author_name} (@{author_username}, ID: {author_id})\n"
+                    "ID сообщения: {message_id}\n"
+                    "Причина активации: {trigger_reason}\n"
+                    "Ответ на: {reply_context}\n"
+                    "Текст: {content}\n"
+                    "Вложения: {attachments_info}\n"
+                    "{missed_context_formatted}"
                 )
             },
-            "deliver": {"type": "string", "description": "Delivery target: 'log', 'telegram', 'discord', 'origin'", "default": "log"},
+            "deliver": {"type": "string", "description": "Delivery target: 'log', 'telegram', 'discord'", "default": "log"},
             "hermes_port": {"type": "integer", "description": "Port of Hermes webhook daemon (default 8644)", "default": 8644},
             "auto_trigger": {"type": "boolean", "description": "Enable auto HTTP POSTing payloads to Hermes webhook when new messages arrive", "default": True}
         },
@@ -3504,6 +3510,7 @@ class DiscordWorkspace(Workspace):
         self,
         route_name: str = "discord-inbound",
         wake_words: str = "диром, dirom",
+        secret: str = "unai-local-token",
         always_trigger_in_dm: bool = True,
         trigger_on_reply: bool = True,
         trigger_on_mention: bool = True,
@@ -3523,6 +3530,7 @@ class DiscordWorkspace(Workspace):
         else:
             self._hermes_wake_words = []
 
+        self._hermes_secret = secret or "unai-local-token"
         self._hermes_always_trigger_dm = bool(always_trigger_in_dm)
         self._hermes_trigger_on_reply = bool(trigger_on_reply)
         self._hermes_trigger_on_mention = bool(trigger_on_mention)
@@ -3531,15 +3539,15 @@ class DiscordWorkspace(Workspace):
         if not prompt:
             prompt = (
                 "[Hermes Webhook: Входящее сообщение Discord]\n"
-                "Сервер ID: {payload.guild_id}\n"
-                "Канал ID: {payload.channel_id}\n"
-                "От: {payload.author_name} (@{payload.author_username}, ID: {payload.author_id})\n"
-                "ID сообщения: {payload.message_id}\n"
-                "Причина активации: {payload.trigger_reason}\n"
-                "Ответ на: {payload.reply_context}\n"
-                "Текст: {payload.content}\n"
-                "Вложения: {payload.attachments_info}\n"
-                "{payload.missed_context_formatted}"
+                "Сервер ID: {guild_id}\n"
+                "Канал ID: {channel_id}\n"
+                "От: {author_name} (@{author_username}, ID: {author_id})\n"
+                "ID сообщения: {message_id}\n"
+                "Причина активации: {trigger_reason}\n"
+                "Ответ на: {reply_context}\n"
+                "Текст: {content}\n"
+                "Вложения: {attachments_info}\n"
+                "{missed_context_formatted}"
             )
 
         hermes_bin = shutil.which("hermes") or "/home/kasperenok/.local/bin/hermes"
@@ -3548,6 +3556,8 @@ class DiscordWorkspace(Workspace):
             "webhook",
             "subscribe",
             route_name,
+            "--secret",
+            self._hermes_secret,
             "--prompt",
             prompt,
             "--deliver",
@@ -3568,6 +3578,7 @@ class DiscordWorkspace(Workspace):
         return {
             "route_name": route_name,
             "webhook_url": target_url,
+            "secret": self._hermes_secret,
             "wake_words": self._hermes_wake_words,
             "always_trigger_in_dm": self._hermes_always_trigger_dm,
             "trigger_on_reply": self._hermes_trigger_on_reply,
